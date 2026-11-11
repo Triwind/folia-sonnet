@@ -263,7 +263,13 @@ jobs:
           fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           mkdir -p dist-android
-          cp android/app/build/outputs/apk/release/app-release.apk \
+          APK_DIR="android/app/build/outputs/apk/release"
+          APK="$(ls "$APK_DIR"/app-release*.apk 2>/dev/null | head -1 || true)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::找不到 APK ($APK_DIR/app-release*.apk)"
+            exit 1
+          fi
+          cp "$APK" \
              "dist-android/folia-sonnet-${VERSION}-release.apk"
           if [[ -f android/app/build/outputs/bundle/release/app-release.aab ]]; then
             cp android/app/build/outputs/bundle/release/app-release.aab \
