@@ -89,7 +89,7 @@ android {
          * 本机验证一直用真机（arm64），所以不影响发布流程。
          */
         ndk {
-            abiFilters 'arm64-v8a'
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
         }
     }
     signingConfigs {
