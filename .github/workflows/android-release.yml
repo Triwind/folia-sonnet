@@ -211,8 +211,14 @@ jobs:
         # 上一次就差点因此漏判（详见本机 build-apk.sh 里的同一段注释）。
         run: |
           set -euo pipefail
-          APK="android/app/build/outputs/apk/release/app-release.apk"
-          test -f "$APK" || { echo "没有产出 APK"; exit 1; }
+          APK_DIR="android/app/build/outputs/apk/release"
+          APK="$(ls "$APK_DIR"/app-release*.apk 2>/dev/null | head -1 || true)"
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "没有产出 APK (期望 $APK_DIR/app-release*.apk, 有签名则为 app-release.apk, 无签名则为 app-release-unsigned.apk)"
+            ls -la "$APK_DIR" 2>/dev/null || true
+            exit 1
+          fi
+          echo "校验产物: $APK"
           unzip -l "$APK" | grep -E "assets/public/wallpaper\.html|assets/public/assets/bootstrap-.*\.js" \
             || { echo "Web 产物没进包 —— 大概率是 cap sync 那一步没跑"; exit 1; }
           unzip -p "$APK" "assets/public/assets/wallpaper-*.js" | grep -c "wallpaper-stage" \
