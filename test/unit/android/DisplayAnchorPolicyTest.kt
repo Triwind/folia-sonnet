@@ -1,5 +1,6 @@
 package top.izuna.foliamajor.player
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -41,5 +42,52 @@ class DisplayAnchorPolicyTest {
         assertFalse(playerAudible(true, true))
         assertFalse(playerAudible(false, false))
         assertFalse(playerAudible(false, true))
+    }
+
+    @Test
+    fun `要求播着却在等数据才算卡住`() {
+        // #314：网络一卡播放器停在 BUFFERING，播放意图还在。
+        assertTrue(playerStalled(playWhenReady = true, bufferingState = true, isPlaying = false))
+    }
+
+    @Test
+    fun `用户暂停后即便还在缓冲也不算卡住`() {
+        assertFalse(playerStalled(playWhenReady = false, bufferingState = true, isPlaying = false))
+    }
+
+    @Test
+    fun `出错或放完停在非缓冲状态不算卡住`() {
+        // IDLE / ENDED：playWhenReady 可能还是 true，但它不会自己好起来。
+        assertFalse(playerStalled(playWhenReady = true, bufferingState = false, isPlaying = false))
+    }
+
+    @Test
+    fun `真在出声不算卡住`() {
+        assertFalse(playerStalled(playWhenReady = true, bufferingState = false, isPlaying = true))
+        assertFalse(playerStalled(playWhenReady = true, bufferingState = true, isPlaying = true))
+    }
+
+    @Test
+    fun `后台一秒一拍的陈旧采样补上墙钟后不触发核对写锚点`() {
+        // #320：采样在 10_000，过了 900ms 核对；外推锚点此刻约在 10_900。
+        val display = extrapolatedDisplayPositionMs(10_000L, 1_000L, 1_900L, true, 1f)
+        assertEquals(10_900L, display)
+        assertFalse(displayAnchorNeedsWrite(true, 10_900L, true, display))
+        // 不补的话差 900ms，必然越过容差往回拽。
+        assertTrue(displayAnchorNeedsWrite(true, 10_900L, true, 10_000L))
+    }
+
+    @Test
+    fun `外推按倍速并封顶`() {
+        assertEquals(11_000L, extrapolatedDisplayPositionMs(10_000L, 1_000L, 1_500L, true, 2f))
+        assertEquals(10_000L + DISPLAY_POSITION_EXTRAPOLATE_MAX_MS,
+            extrapolatedDisplayPositionMs(10_000L, 1_000L, 60_000L, true, 1f))
+        assertEquals(10_000L, extrapolatedDisplayPositionMs(10_000L, 5_000L, 1_000L, true, 1f))
+    }
+
+    @Test
+    fun `没在出声或采样失效时不外推`() {
+        assertEquals(10_000L, extrapolatedDisplayPositionMs(10_000L, 1_000L, 1_900L, false, 1f))
+        assertEquals(10_000L, extrapolatedDisplayPositionMs(10_000L, 0L, 1_900L, true, 1f))
     }
 }

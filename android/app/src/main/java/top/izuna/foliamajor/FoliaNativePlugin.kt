@@ -1,6 +1,7 @@
 package top.izuna.foliamajor
 import android.Manifest
 import android.app.Activity
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ContentResolver
 import android.content.Intent
@@ -140,17 +141,29 @@ class FoliaNativePlugin : Plugin() {
          * 走桥的整段响应在 Java heap 里会被放大好几倍：原始 byte[] → base64 字符串（1.33×）
          * → `PluginResult.toString()` 再把整份 JSON 序列化成一条完整字符串。实测 256MB 堆
          * 的机器上 20MB 左右就会 OOM（#261，`Failed to allocate 150994952 byte`）。
-         * 所以默认只给 8MiB：接口 JSON 远小于它，真更大的东西本来就不该走桥（#262）。
+         *
+         * ⚠️ 2026-11-18 又炸了一次（`Failed to allocate 16874384 byte`，崩溃时堆只剩 6.7MB）：
+         * 一份**在 8MiB 以内**的响应，只靠序列化放大就补上了最后一刀。所以上限收到 4MiB ——
+         * 2MiB 试过一版，结果把封面缓存整片打挂（`Native HTTP response exceeds the bridge size limit`），
+         * 那个代价换不来多少安全余量。真正更大的东西该走落盘 + 返回路径（#262）。
          */
-        const val DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+        const val DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
         /**
          * 调用方可以按需放宽到这么大，但不会再大。
          *
-         * 32MiB 已经是「8 倍放大后仍然可能撞穿 256MB 堆」的临界值，只留给调用方明确知道
-         * 自己在干什么的场景（例如导出用的文本），不作为默认值。
+         * 从 32MiB 收到 8MiB：按 8 倍放大算是 64MB 的瞬时峰值，在 256MB 堆上已经贴着危险线。
+         * 再大的场景必须改成原生落盘 + 返回文件路径，而不是把整份塞进桥里。
          */
-        const val HARD_MAX_RESPONSE_BYTES = 32 * 1024 * 1024
+        const val HARD_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+        /**
+         * 大到这个尺寸的响应在交出前记一条日志（只看 size + host）。
+         *
+         * 崩溃往往发生在 call.resolve() 的序列化里 —— 那时已经打不出日志了，
+         * 所以要在**交出去之前**把现场留下。1MiB 是个不会刷屏、又能盖住危险区间的档。
+         */
+        const val LARGE_RESPONSE_LOG_BYTES = 1024 * 1024
 
         /**
          * 超限时给 JS 的那句话。
@@ -1095,6 +1108,20 @@ class FoliaNativePlugin : Plugin() {
                             result.put("headers", responseHeaders)
                             // 实际字节数：排查「谁把响应撑大了」时唯一可信的口径。
                             result.put("byteLength", bytes.size)
+                            /*
+                             * 大响应留一条痕迹（2026-11-18 OOM 报告 §5 的排查盲点）：
+                             * 崩溃恰好发生在 call.resolve() 的序列化里，那时已经来不及打日志，
+                             * 所以要在**交出去之前**把「多大、哪个主机」记下来。只记 host，
+                             * 不记整条 URL —— 那些 query 里带 cookie 与签名。
+                             */
+                            if (bytes.size >= LARGE_RESPONSE_LOG_BYTES) {
+                                Log.w(
+                                    TAG,
+                                    "httpRequest large response: " + bytes.size + " bytes from " + runCatching { java.net.URI(url).host }.getOrNull()
+                                        + " (heap " + Runtime.getRuntime().let { (it.totalMemory() - it.freeMemory()) / 1048576 } +
+                                        "MiB used of " + Runtime.getRuntime().maxMemory() / 1048576 + "MiB max)",
+                                )
+                            }
                             val text = if (wantsTextPayload(responseMode, response.headers.get("Content-Type"))) {
                                 decodeUtf8Strict(bytes)
                             } else {
@@ -1653,6 +1680,7 @@ class FoliaNativePlugin : Plugin() {
             var stored = false
             var name: String? = null
             var loopback: String? = null
+            var storedPath: String? = null
             try {
                 val target = java.io.File(getContext().cacheDir, "folia_video_layer_download.mp4")
                 val part = java.io.File(target.absolutePath + ".part")
@@ -1705,6 +1733,7 @@ class FoliaNativePlugin : Plugin() {
                         stored = true
                         name = VideoLayerFile.displayName(getContext())
                         loopback = videoLayerUrl()
+                        storedPath = target.absolutePath
                     }
                 } else {
                     part.delete()
@@ -1715,6 +1744,14 @@ class FoliaNativePlugin : Plugin() {
             }
             out.put("stored", stored)
             if (name != null) out.put("name", name)
+            /*
+             * 落盘后的真实路径。
+             *
+             * 市场里「桌面壁纸」和「App 内」同时勾选时，视频只需下一次：壁纸层可以
+             * 直接拿这份文件安装（FoliaWallpaper.adoptDownloadedVideo），不必再按
+             * 地址下一遍。`url` 是回环播放地址，文件操作要用这个。
+             */
+            if (storedPath != null) out.put("path", storedPath)
             if (loopback != null) out.put("url", loopback)
             call.resolve(out)
         }.start()
@@ -1797,10 +1834,38 @@ class FoliaNativePlugin : Plugin() {
         try {
             if (localAudioServer == null) localAudioServer = LocalAudioServer(getContext())
             val port = localAudioServer!!.start()
-            return "http://127.0.0.1:" + port + "/video-layer/current"
+            /*
+             * 带上版本参数。
+             *
+             * 路径本身是固定的（/video-layer/current，永远指向「当前那个视频」），
+             * 只靠它的话，换视频之后 URL 一模一样，WebView 会直接复用缓存里的旧字节 ——
+             * 用户看到的就是「换了没反应，必须重启」。服务端那边也加了 no-store，
+             * 这里再给一个每次都不同的地址，双保险。
+             */
+            return "http://127.0.0.1:" + port + "/video-layer/current?v=" + videoLayerVersion()
         } catch (error: Exception) {
             Log.w(TAG, "Could not start the local server for the video layer", error)
             return null
+        }
+    }
+
+    /**
+     * 视频层内容的版本号：换过文件就变。
+     *
+     * 用文件最后修改时间 + 长度，不引入额外的状态 —— 重新 store 之后这两者都会变，
+     * 而不换文件时去取播放地址（比如页面重建）又能命中同一份缓存。
+     */
+    private fun videoLayerVersion(): String {
+        return try {
+            val file = VideoLayerFile.file(getContext())
+            if (file == null || !file.exists()) {
+                "0"
+            } else {
+                file.lastModified().toString() + "-" + file.length()
+            }
+        } catch (error: Exception) {
+            Log.w(TAG, "Could not read the video layer version", error)
+            "0"
         }
     }
 
@@ -3225,6 +3290,58 @@ class FoliaNativePlugin : Plugin() {
             return false
         } catch (ignored: Throwable) {
             return false
+        }
+    }
+
+    /**
+     * 用系统 intent 打开一个地址 —— 主要给 bilibili:// 这一类自有 schema 用。
+     *
+     * 为什么不能走 Browser 插件（Custom Tab）：Custom Tab 只认 http(s)，把
+     * bilibili://xxx 交给它什么也不会发生，用户看到的就是「点了按钮没反应」。
+     * 而唤端本来就是整件事的一部分（活动页的「免费领大会员」最后就是跳到 App 里领）。
+     *
+     * 两条用法：
+     *   · 只给 url：直接 startActivity，没装 App 就 reject；
+     *   · 给 url + fallbackUrl：没装 App 时改用浏览器打开 fallbackUrl（活动页 / 下载页）。
+     *     Android 11+ 的包可见性让「先查有没有 App」不可靠，所以真正的判定放在
+     *     startActivity 抛 ActivityNotFoundException 那一步。
+     */
+    @PluginMethod
+    fun openUrl(call: PluginCall) {
+        val url = call.getString("url")
+        if (url.isNullOrBlank()) {
+            call.reject("url is required")
+            return
+        }
+        val fallbackUrl = call.getString("fallbackUrl")
+        val activity = getActivity()
+        try {
+            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            (activity ?: getContext()).startActivity(intent)
+            val result = JSObject()
+            result.put("opened", url)
+            call.resolve(result)
+        } catch (missing: ActivityNotFoundException) {
+            if (!fallbackUrl.isNullOrBlank()) {
+                try {
+                    (activity ?: getContext()).startActivity(
+                        Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl))
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                    val result = JSObject()
+                    result.put("opened", fallbackUrl)
+                    result.put("fellBack", true)
+                    call.resolve(result)
+                    return
+                } catch (fallbackMissing: Exception) {
+                    call.reject("No app can open " + url, fallbackMissing)
+                    return
+                }
+            }
+            call.reject("No app can open " + url, missing)
+        } catch (error: Exception) {
+            call.reject("Failed to open " + url, error)
         }
     }
 

@@ -35,6 +35,7 @@ describe('the platform column', () => {
         expect(rowStatus(row('a', signedIn))).toBe('signed-in');
         expect(rowStatus(row('a', ranOut))).toBe('ran-out');
         expect(rowStatus(row('a'))).toBe('signed-out');
+        expect(rowStatus(row('a', { status: 'unknown', hydration: 'loading' }))).toBe('checking');
         expect(rowStatus(row('a', { requiresAccount: false }))).toBe('accountless');
         // Out of reach wins over everything: such a row cannot be chosen, whoever was signed in there.
         expect(rowStatus(row('a', { ...signedIn, ...off }))).toBe('off');
@@ -154,6 +155,7 @@ describe('what a chosen row leads to', () => {
         expect(rowLeadsTo('signed-out')).toBe('sign-in');
         expect(rowLeadsTo('ran-out')).toBe('sign-in');
         expect(rowLeadsTo('off')).toBeNull();
+        expect(rowLeadsTo('checking')).toBe('sign-in');
     });
 });
 
@@ -357,6 +359,8 @@ describe('the texts the window can ask for', () => {
             netease: null, kugou: null, bodian: null, qishui: null, appleMusic: null, feiniu: null,
             // 洛雪自定义音源不登录，也就没有为某一种失败另写的一句话。
             lxmusic: null,
+            // B 站扫码登录走通用的那套失败文案，没有为某一种失败另写一句。
+            bilibili: null,
             // 扫错 App 的那一句按后端有没有 QQ 音乐 App 扫码说（这里还没问到后端）。
             qq: { 'local-service-unavailable': 'home.loginCaseQqRestart', 'wrong-scan-app': 'home.loginCaseQqWrongScanAppMobileOnly', 'device-limit': 'home.loginCaseQqDeviceLimit' },
             ytm: { 'browser-unfinished': 'home.loginCaseYtmUnfinished', 'no-browser': 'home.loginNoBrowserYtm' },

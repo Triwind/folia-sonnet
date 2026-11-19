@@ -1,7 +1,8 @@
 import React from 'react';
-import { AudioLines, Disc, SlidersHorizontal, ListMusic, FileAudio, FileText, Radio, Cloud, Puzzle } from 'lucide-react';
+import { AudioLines, Disc, SlidersHorizontal, ListMusic, FileAudio, FileText, Radio, Cloud } from 'lucide-react';
 import { locatePlayingSong } from './app/playing-song-locator/playingSongLocator';
 import { useTranslation } from 'react-i18next';
+import { useLibraryAccountProviders } from '../library/core/account/useLibraryAccount';
 import { Album, Artist, SongResult, Theme, PlayerState, ReplayGainMode, ThemeMode, VisualizerMode } from '../types';
 import type { LibraryAccountController } from '../library/core/account/account.contract';
 import ControlsTab from './panelTab/ControlsTab';
@@ -20,6 +21,7 @@ import SongHeader from './panelTab/shell/SongHeader';
 import TabDock from './panelTab/shell/TabDock';
 import type { SongLike } from './panelTab/shell/LikeButton';
 import type { OnlineLyricsState } from '../types';
+import { useBilibiliMvStore } from '../stores/useBilibiliMvStore';
 import type { AudioQualityPreference } from '../types/onlineMusic';
 import type { ThemeSourceModel } from '../hooks/themeControllerState';
 import { getPlaybackSourceRef } from '../utils/appPlaybackGuards';
@@ -59,6 +61,9 @@ type UnifiedPanelPlaybackProps = {
     isGeneratingTheme: boolean;
     hasLyrics: boolean;
     canGenerateAITheme: boolean;
+    /** 「匹配 MV」：给当前这首歌重新找一条 B 站投稿画面（清缓存强制重搜），匹配后从头放。 */
+    onRematchMv: () => void;
+    isRematchingMv: boolean;
     theme: Theme;
     onThemeChange: (theme: Theme) => void;
     onBgModeChange: (mode: ThemeMode) => void;
@@ -119,6 +124,8 @@ type UnifiedPanelQueueProps = {
 
 type UnifiedPanelAccountProps = {
     accountController: LibraryAccountController;
+    /** 打开某个 UP 主的投稿页（账号页里关注 / 粉丝列表点头像）。不给就不可点。 */
+    onOpenBilibiliUser?: (mid: number, name: string) => void;
     audioQuality: AudioQualityPreference;
     onAudioQualityChange: (quality: AudioQualityPreference) => void;
     onSyncData: () => void;
@@ -153,6 +160,10 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
 }) => {
     countRender('UnifiedPanel');
     const { t } = useTranslation();
+    // 这一家的质量选项选的其实是画面（见下面那页标题）：认它一个就够，别到处散落字符串。
+    const { activeProviderId } = useLibraryAccountProviders(account.accountController);
+    const { onOpenBilibiliUser } = account;
+    const qualityIsPicture = activeProviderId === 'bilibili';
     // Read here and not handed down from App.tsx: a change of tab renders the panel, not the app.
     const currentTab = useAppViewStore(state => state.panelTab);
     const {
@@ -173,6 +184,8 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
         isGeneratingTheme,
         hasLyrics,
         canGenerateAITheme,
+        onRematchMv,
+        isRematchingMv,
         theme,
         onThemeChange,
         onBgModeChange,
@@ -239,6 +252,16 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
         onToggleDaylight,
     } = account;
 
+    /*
+     * B 站下这一栏显示的是 MV store 那一份，不是 audioQuality。
+     *
+     * 两个值各管一半（音频流 / MV 画面，见 buildPlayerPanelModel 的 onAudioQualityChange），
+     * 而用户在设置页的 MV 子选项里改的正是 MV store 那一份 —— 面板要是照旧显示
+     * audioQuality，就会出现「设置里改成 1080P 了，面板还写着 720P」。
+     */
+    const mvQuality = useBilibiliMvStore(state => state.quality);
+    const displayedQuality = qualityIsPicture ? mvQuality : audioQuality;
+
     // 矮而宽（横过来的手机）：页签挪到右侧竖轨，把底边那一条让给页签内容（见 PanelShell）。
     const isWideShort = useIsWideShortViewport();
 
@@ -260,7 +283,18 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
         isFmMode 
             ? { id: 'queue' as PanelTab, label: t('home.radio'), icon: Radio }
             : { id: 'queue' as PanelTab, label: t('panel.playlist'), icon: ListMusic },
-        { id: 'account' as PanelTab, label: t('panel.account'), icon: AudioLines },
+        /*
+         * 这一页的标题跟着平台走。
+         *
+         * 视频站那一家的「音质」实际是清晰度 —— 取流时画面和声音是绑在一起选的，
+         * 叫「音质」会让人以为能单独调声音。认的是 isVideoPlatform，和页里那行
+         * 质量选项用的是同一个判断（AccountTab 的 qualityIsPicture），别让两处对不上。
+         */
+        {
+            id: 'account' as PanelTab,
+            label: qualityIsPicture ? t('panel.videoQuality') : t('panel.account'),
+            icon: AudioLines,
+        },
     ];
 
     if (isLocal) {
@@ -271,7 +305,7 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
         tabs.splice(1, 0, { id: 'onlineLyrics' as PanelTab, label: t('localMusic.lyrics'), icon: FileText });
     }
 
-    foliumTabs.forEach((tab) => tabs.push({ id: tab.id, label: tab.label, icon: Puzzle }));
+    foliumTabs.forEach((tab) => tabs.push({ id: tab.id, label: tab.label, icon: tab.icon }));
 
     // A mod tab can vanish while open (mod disabled or reloaded): fall back to the cover tab.
     const currentTabExists = tabs.some((tab) => tab.id === currentTab);
@@ -381,6 +415,8 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                     onGenerateAITheme={onGenerateAITheme}
                     isGeneratingTheme={isGeneratingTheme}
                     canGenerateAITheme={canGenerateAITheme}
+                    onRematchMv={onRematchMv}
+                    isRematchingMv={isRematchingMv}
                     theme={theme}
                     onThemeChange={onThemeChange}
                     onBgModeChange={onBgModeChange}
@@ -411,6 +447,7 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                         playerState={playerState}
                         modeLabel={fmModeLabel}
                         onOpenModePicker={onOpenFmModePicker}
+                        onOpenLattice={queue.onOpenLattice}
                         onTogglePlay={onTogglePlay}
                         onNextTrack={onNextTrack}
                         onPrevTrack={onPrevTrack}
@@ -454,7 +491,7 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
             {currentTab === 'account' && (
                 <AccountTab
                     accountController={accountController}
-                    audioQuality={audioQuality}
+                    audioQuality={displayedQuality}
                     onAudioQualityChange={onAudioQualityChange}
                     onSyncData={onSyncData}
                     isSyncing={isSyncing}
@@ -463,6 +500,11 @@ const UnifiedPanel: React.FC<UnifiedPanelProps> = ({
                         onToggle();
                         onNavigateHome();
                     }}
+                    onOpenBilibiliUser={onOpenBilibiliUser && ((mid, name) => {
+                        // 面板先收起来：歌手页是全屏的，留着这一层在上面没有意义。
+                        onToggle();
+                        onOpenBilibiliUser(mid, name);
+                    })}
                 />
             )}
             {currentTab === 'local' && isLocal && (

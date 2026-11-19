@@ -278,14 +278,29 @@ class FoliaWallpaperPlugin : Plugin() {
         // 这两个模式是互斥的两层：跟随样式走 WebView 叠层，精简走原生小悬浮窗。
         // 用户在设置里切样式的那一刻就要生效，所以这里顺手催一次，不等 600ms 巡检。
         val overlay = top.izuna.foliamajor.wallpaper.FloatingLyricsOverlay.shared(context)
-        overlay.start()
+        val overlayAllAppsFlag: Float? = WallpaperLyricsState.tuning()?.get("wp.overlayAllApps")
+        val overlayAllApps = (overlayAllAppsFlag ?: 0f) >= 0.5f
         /*
-         * 叠加模式下「左右 / 宽度」是设置里的滑条管的，而位置只在挂窗口和转屏时才算 ——
-         * 少了这一下，滑条拖到头小窗也一动不动。这里每次外观下发都重新摆一次，
-         * 滑条边拖边看得到（这就是设置里那几根条要的「实时预览」）。
+         * 只在用户**明确要**「在所有应用上叠加」时挂悬浮窗（#424）。
+         *
+         * 悬浮窗是系统级窗口，压在桌面图标**上面** —— 没被要求时挂着它，用户看到的就是
+         * 「图标都看不见了」（反馈原话）。壁纸服务那边画的内容在图标**下面**，才是可接受的默认路径。
+         *
+         * 以前这里是 `overlayAllApps || !wallpaperActive`：第二个条件写反了 —— 壁纸没设上时
+         * 它恒真，于是永远启动悬浮窗。现在只认开关本身。
          */
-        overlay.applyOverlayTuning()
-        call.resolve()
+        if (overlayAllApps) {
+            overlay.start()
+            /*
+             * 叠加模式下「左右 / 宽度」是设置里的滑条管的，而位置只在挂窗口和转屏时才算 ——
+             * 少了这一下，滑条拖到头小窗也一动不动。这里每次外观下发都重新摆一次，
+             * 滑条边拖边看得到（这就是设置里那几根条要的「实时预览」）。
+             */
+            overlay.applyOverlayTuning()
+        } else {
+            // 壁纸自己在画：把可能残留的悬浮窗撤掉，别留一层在图标上面。
+            overlay.stop()
+        }
     }
 
     /**
@@ -499,10 +514,51 @@ class FoliaWallpaperPlugin : Plugin() {
     }
 
     /**
+     * 把一个**已经下载好的**本地文件安装成壁纸视频，不再下载。
+     *
+     * 为什么需要：背景市场里同时勾「桌面壁纸」和「App 内」时，视频层那边已经通过
+     * `downloadVideoLayerFile` 把同一个视频下到 cache 里了；桌面壁纸再走一次
+     * `downloadVideo` 就是同一个几十 MB 的文件下两遍。这里直接拿那份文件落成壁纸层的
+     * 那一份（`WallpaperBackgroundVideo` 仍要自己的文件名，所以是拷贝而不是引用）。
+     *
+     * `path` 是原生自己给的路径（video layer 的下载结果），不接受任意外部路径之外的
+     * 用法 —— 调用方只会把刚下载的那一份传进来。
+     */
+    @PluginMethod
+    fun adoptDownloadedVideo(call: PluginCall) {
+        val path = call.getString("path")
+        if (path.isNullOrBlank()) {
+            call.reject("缺少 path")
+            return
+        }
+        val source = java.io.File(path)
+        if (!source.isFile || source.length() <= 0) {
+            call.reject("文件不存在")
+            return
+        }
+        Thread {
+            val key = try {
+                WallpaperBackgroundVideo.store(context, android.net.Uri.fromFile(source))
+            } catch (error: Throwable) {
+                android.util.Log.w(TAG, "adopting the downloaded video failed", error)
+                null
+            }
+            val out = JSObject()
+            out.put("downloaded", key != null)
+            call.resolve(out)
+        }.start()
+    }
+
+    /**
      * 按地址下载一张图当壁纸背景（背景市场用）。
      *
      * 和 downloadVideo 同一个道理：不让 WebView 碰字节，原生下完直接解码压成 JPEG 落盘，
      * 之后壁纸层读的还是那个文件。
+     *
+     * ⚠️ 图片这一路没有像视频那样做「下一次、两边装」：
+     * 壁纸层要的是**压过的高质量 JPEG**（铺满一屏，体积敏感），而 App 内要的是
+     * 原始图片拿去当莫奈来源 —— 两者产物不同，硬凑一份反而会掉画质。
+     * 视频是字节完全一致的同一个文件，才值得共用（见 adoptDownloadedVideo）。
      */
     @PluginMethod
     fun downloadImage(call: PluginCall) {
@@ -518,9 +574,15 @@ class FoliaWallpaperPlugin : Plugin() {
         val cropRight = call.getFloat("cropRight", 1f) ?: 1f
         val cropBottom = call.getFloat("cropBottom", 1f) ?: 1f
         Thread {
-            val key = WallpaperBackgroundImage.storeFromUrl(
-                context, url, rotation, cropLeft, cropTop, cropRight, cropBottom,
-            )
+            // 裸线程上没有别人兜底：任何 Throwable（含 OOM）漏出去都是未捕获异常、应用崩溃，且 Promise 永远不回（#364）。
+            val key = try {
+                WallpaperBackgroundImage.storeFromUrl(
+                    context, url, rotation, cropLeft, cropTop, cropRight, cropBottom,
+                )
+            } catch (error: Throwable) {
+                android.util.Log.w(TAG, "downloadImage failed", error)
+                null
+            }
             val out = JSObject()
             out.put("downloaded", key != null)
             call.resolve(out)

@@ -207,10 +207,11 @@ export async function loadOnlineSongLyrics(
         onPureMusicChange?: (isPureMusic: boolean) => void;
         onStateChange?: (state: OnlineLyricsState | null) => void;
         onAutoMatchStart?: () => void;
+        onAutoMatchError?: () => void;
         onDone: () => void;
     }
 ): Promise<void> {
-    const { isCurrent, onLyrics, onPureMusicChange, onStateChange, onAutoMatchStart, onDone } = callbacks;
+    const { isCurrent, onLyrics, onPureMusicChange, onStateChange, onAutoMatchStart, onAutoMatchError, onDone } = callbacks;
     const lyricCacheKey = getSongResourceCacheKey('lyric', song);
     const onlineLyricsState = await loadOnlineLyricsState(song);
   const initialSettingsLyricSettings = useLyricSettingsStore.getState();
@@ -316,6 +317,19 @@ export async function loadOnlineSongLyrics(
         if (resolvedLyrics) onLyrics(resolvedLyrics);
         onDone();
 
+        /*
+         * 视频平台的歌不去自动匹配。
+         *
+         * 自动匹配是拿歌名去别的平台的曲库里找同名歌曲 —— 对一首音乐是对的，对一条
+         * 视频是错的：视频标题和别的平台的歌曲没有对应关系，找出来的东西不相干
+         * （标题带「教程」「实况」的那种更是一定错）。这类平台自己就带歌词来源
+         * （字幕），有就有，没有就没有。
+         */
+        if (omni.ownsItsLyricsOnly(song)) {
+            onDone();
+            return;
+        }
+
         try {
             onAutoMatchStart?.();
             const metadata = getProviderSongMetadata(song);
@@ -369,6 +383,7 @@ export async function loadOnlineSongLyrics(
             }
         } catch (error) {
             console.warn('[OnlinePlayback] Failed to auto-match best lyric:', error);
+            if (isCurrent()) onAutoMatchError?.();
         }
     }
 

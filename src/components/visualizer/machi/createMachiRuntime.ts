@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { MotionValue } from 'framer-motion';
 import type { AudioBands, Line, LyricRenderQuality, Theme } from '../../../types';
 import { getDrumHits, type DrumHits } from '../../../services/analysis/drumHits';
+import { readEffectTrack } from '../../../services/beatFx/effectTracks';
 import { BEAT_EFFECT_IDS, smartBeatActive } from '../../../services/beatFx/beatEffects';
 import {
     getBeatEffectStrength,
@@ -26,6 +27,8 @@ import {
     type MachiBeatFrame,
 } from './engine/beatFx';
 import { MachiCamera } from './engine/camera';
+import { readGyroTiltEnabledForMode, useGyroSettingsStore } from '../../../stores/useGyroSettingsStore';
+import { subscribeGyroTilt } from '../backgrounds/gyroTilt';
 import { MachiClock } from './engine/clock';
 import {
     buildMachiLightningTimes,
@@ -185,6 +188,10 @@ export class MachiRuntime {
     private readonly renderer: THREE.WebGLRenderer;
     private readonly scene = new THREE.Scene();
     private readonly camera = new MachiCamera();
+    /** 陀螺仪读数订阅；关闭开关或卸载时为 null。 */
+    private unsubscribeGyro: (() => void) | null = null;
+    /** 监听设置里陀螺仪开关的变化。 */
+    private unsubscribeGyroStore: (() => void) | null = null;
     private readonly clock = new MachiClock();
     private readonly blend: MachiColorBlend;
     private readonly materials: MachiMaterials;
@@ -350,10 +357,44 @@ export class MachiRuntime {
         this.camera.onCommit = view => this.options.onViewChange?.(view, this.stageId);
         this.camera.onWake = () => this.wake();
         this.camera.setMotion(options.tuning.motion, options.tuning.motionSpeed);
+        /*
+         * 陀螺仪：相机那侧早就写好了（MachiCamera.setGyro / setGyroOffsets），
+         * 缺的只是「谁来订阅、谁来喂」—— 以前没人接，所以町景晃手机没反应。
+         *
+         * 预览（封面缩略图）不接：那里没有用户在看，白白占一个传感器监听。
+         */
+        if (!options.previewMode) this.attachGyro();
         this.resizeObserver = new ResizeObserver(this.onResize);
         this.resizeObserver.observe(options.host);
         this.resize(options.host.clientWidth, options.host.clientHeight);
         this.clock.paused = this.paused || this.staticMode;
+    }
+
+    /**
+     * 把陀螺仪接进町景的相机。
+     *
+     * 开关来自全局设置（useGyroSettingsStore），和别的 3D 背景共用一个；
+     * 订阅本身也走 backgrounds/gyroTilt.ts 那一份，读数、死区、灵敏度、
+     * 平滑、横竖屏换算都在那边处理好了，这里只负责把结果交给相机。
+     *
+     * 组件卸载 / 换场景时由 dispose 里的 unsubscribeGyro 收尾 —— 传感器监听
+     * 不解除的话，切到别的背景还在后台白白回调。
+     */
+    private attachGyro() {
+        const apply = () => {
+            // 全局开关 + 町景自己的开关，两个都开才吃读数。
+            const enabled = readGyroTiltEnabledForMode('machi');
+            this.camera.setGyro(enabled);
+            if (!enabled) {
+                this.unsubscribeGyro?.();
+                this.unsubscribeGyro = null;
+                return;
+            }
+            this.unsubscribeGyro ??= subscribeGyroTilt(offsets => this.camera.setGyroOffsets(offsets));
+        };
+        apply();
+        // 开关随时可能在设置里被拨动。
+        this.unsubscribeGyroStore = useGyroSettingsStore.subscribe(apply);
     }
 
     /** 场景和着色器都好了：接上拖拽和时钟，画第一帧，开始循环。 */
@@ -916,6 +957,16 @@ export class MachiRuntime {
         // 光斑的一跳只在干的地面上（湿的地面上是涟漪）。
         beat.thump = resolveMachiDrumRipples(hits, time, rippleStrength, this.kickRings) * (1 - machiRippleWetness(this.environment.wetness));
         resolveMachiScreenFlash(hits, time, flashStrength, beat);
+        /*
+         * 霓虹泛光：不吃拍点、只吃人声曲线 —— 这一套整个画面是霓虹招牌，唱到高处时
+         * 招牌本身更亮、雾里的灯晕更散，用的就是 frame 里本来就有的 bloom / neon 倍数。
+         */
+        const neonGlowStrength = idle ? 0 : getBeatEffectStrength(BEAT_EFFECT_IDS.machiNeonGlow);
+        if (neonGlowStrength > 0) {
+            const glow = Math.min(1, readEffectTrack(BEAT_EFFECT_IDS.machiNeonGlow) * 1.6) * 0.6 * neonGlowStrength;
+            beat.bloom += glow;
+            beat.neon += glow * 0.5;
+        }
         this.ground.setKicks(focus.x, focus.z, this.kickRings);
         return beat;
     }
@@ -1101,6 +1152,10 @@ export class MachiRuntime {
         window.clearTimeout(this.signRepaintTimer);
         window.clearInterval(this.clockTimer);
         this.resizeObserver.disconnect();
+        this.unsubscribeGyro?.();
+        this.unsubscribeGyro = null;
+        this.unsubscribeGyroStore?.();
+        this.unsubscribeGyroStore = null;
         this.camera.dispose();
         withdrawMachiShownScene(this);
         withdrawMachiDegrade(this);

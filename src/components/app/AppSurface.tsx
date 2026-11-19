@@ -16,7 +16,10 @@ import { FoliumStageLayerSlot } from '../../mods/folium/registries/stageLayers';
 import { type AutomixDeckId } from '../../services/automix/useAutomixDecks';
 // HiFi 路线上 mpv 拿着设备：两块网页 deck 既不该有 src，它们的事件也不该改动传输状态。
 import { isHifiRoute } from '../../services/hifi/hifiPlayback';
+import React from 'react';
 import { consumeProgrammaticPause, playbackFade } from '../../services/playbackFade';
+import { isCapacitorAndroid } from '../../platform/runtime';
+import { useAudioSettingsStore } from '../../stores/useAudioSettingsStore';
 import { hasLoopedToStart } from '../../services/playedTrackCache';
 import { currentTime, lyricCurrentTime } from '../../stores/motionSignals';
 import { endLoadingToPlay, usePlaybackStore } from '../../stores/usePlaybackStore';
@@ -37,9 +40,12 @@ import { LatticeFmNotice } from '../modal/playback-entry-view/LatticeFmNotice';
 import { PlaybackEntryViewPrompt } from '../modal/playback-entry-view/PlaybackEntryViewPrompt';
 import ReleaseNotesDialog from '../modal/ReleaseNotesDialog';
 import { UserGuideModal } from '../modal/UserGuideModal';
+import { VipPromoModal } from '../bilibili/promo';
 import ThemeQuickEditorHost from '../panelTab/ThemeQuickEditor';
 import PonderHost from '../ponder/PonderHost';
-import VisualizerRenderer from '../visualizer/VisualizerRenderer';
+import SceneHost from '../scenes/engine/SceneHost';
+import BilibiliMvLayer from '../bilibili/BilibiliMvLayer';
+import BilibiliVideoStage from '../bilibili/BilibiliVideoStage';
 import WallToolsDockHost from '../wall/WallToolsDock';
 import AddToPlaylistHost from './AddToPlaylistHost';
 import AppShell from './AppShell';
@@ -71,7 +77,20 @@ const Lattice = lazy(loadLattice);
 
 export type AppModel = AppFoundation & AppAudioOutput & AppThemeAndNavigation & AppAccountsAndStage & AppLibraryControllers & AppPlaybackQueue & AppPlaybackBridges & AppChromeAndGestures & AppPublishers & AppCommandPalette & AppPlaybackActions & AppWallAndHome & AppPlayerPanel & AppOverlayModels;
 
+/*
+ * 「与其他音源同时播放」自动恢复的节流状态。
+ *
+ * ★ 放模块级而不是组件 ref：ref 跟着实例走，AppSurface 一旦重建（主题切换、key 变化、
+ * React 严格模式的二次挂载）就归零 —— 与另一个应用「抢焦点 → 被暂停 → 接回来 → 又抢」
+ * 的循环就只在同一次实例生命周期内被封顶三次，跨实例无限重来。节流要防的正是这件事，
+ * 所以它的寿命必须比组件长。
+ */
+let lastAutoResumeAt = 0;
+let autoResumeAttempts = 0;
+
 const AppSurface = ({ model }: { model: AppModel }) => {
+    // 「与其他音源同时播放」：被外部打断后自动恢复只在它开着时生效（见 onPause）。
+    const mixWithOtherAudio = useAudioSettingsStore(state => state.mixWithOtherAudio);
     const {
         accountController, activeProviderId, addPickedSongsToLocalPlaylist, addPickedSongsToNavidromePlaylist,
         addPickedSongsToOnlinePlaylist, alwaysShowMainWindowTitlebar, appDialogsModel, appOverlaysModel, appStyle,
@@ -93,7 +112,7 @@ const AppSurface = ({ model }: { model: AppModel }) => {
         scratchpadPlayback, scratchpadQueue,
         stageActiveEntryKind, stageSource, startupExperience, t, theme, togglePlay, transitionAnimation,
         transitionMode, transparentPlayerBackground, updatePrompt, usesCustomWindowChrome, visualizerAroundWall,
-        visualizerRendererModel, wallHandoff, wallToolsHost, wallpaperMode
+        visualizerRendererModel, songThemePair, wallHandoff, wallToolsHost, wallpaperMode
     } = model;
     const isPlayerChromeHidden = useAppChromeStore(state => state.isPlayerChromeHidden);
     // The two automix decks are identical and interchangeable. Every handler below ignores the
@@ -183,6 +202,30 @@ const AppSurface = ({ model }: { model: AppModel }) => {
                 // source re-pointed, and the deck left silent until play was pressed by hand.
                 // What happens to a failed source belongs to the error path below.
                 if (e.currentTarget.error) return;
+                /*
+                 * 被打断之后自动恢复（「与其他音源同时播放」开着时才生效）。
+                 *
+                 * 系统把音频焦点收走时，Chromium 会**直接把 <audio> 暂停**，不等 Web 层表态 ——
+                 * 到这里时状态机还停在 PLAYING。若这时照常落到 PAUSED，界面就变成「显示在播、
+                 * 其实没声音」，用户再点播放要先把 pause 走一遍，经常就卡在那。
+                 *
+                 * ★ 必须能分清「这是外部打断」还是「用户自己按了暂停」。判据是 `shouldAutoPlay`：
+                 * 用户按暂停时 transport 会先把它置 false 再暂停元素，所以到这里还是 true 就说明
+                 * 这一下不是用户要的。少了这一条，用户按了暂停 1.5 秒后音乐自己又响 —— 那是更糟的 bug。
+                 */
+                if (mixWithOtherAudio && isCapacitorAndroid() && shouldAutoPlay.current) {
+                    const now = Date.now();
+                    if (now - lastAutoResumeAt > 10_000) autoResumeAttempts = 0;
+                    const cooling = now - lastAutoResumeAt < 1_500;
+                    const exhausted = autoResumeAttempts >= 3;
+                    if (!cooling && !exhausted) {
+                        autoResumeAttempts += 1;
+                        lastAutoResumeAt = now;
+                        void e.currentTarget.play().catch(() => undefined);
+                        return;
+                    }
+                    // 接不回来（冷却中 / 已接三次）：老老实实落到 PAUSED，别把界面留在「正在播」。
+                }
                 shouldAutoPlay.current = false;
                 if (!e.currentTarget.ended) {
                     setPlayerState(PlayerState.PAUSED);
@@ -293,7 +336,7 @@ const AppSurface = ({ model }: { model: AppModel }) => {
                 // If single loop is active, native loop handles it.
                 // If not, we handle queue logic.
                 if (effectiveLoopMode !== 'one') {
-                    void handleNextTrack({ allowStopOnMissing: true, shouldNavigateToPlayer: false });
+                    void handleNextTrack({ allowStopOnMissing: true, playedToEnd: true, shouldNavigateToPlayer: false });
                 }
             }}
             onLoadedMetadata={(e) => {
@@ -355,7 +398,7 @@ const AppSurface = ({ model }: { model: AppModel }) => {
                         return;
                     }
 
-                    void handleNextTrack({ allowStopOnMissing: true, shouldNavigateToPlayer: false });
+                    void handleNextTrack({ allowStopOnMissing: true, playedToEnd: true, shouldNavigateToPlayer: false });
                     return;
                 }
 
@@ -564,8 +607,13 @@ const AppSurface = ({ model }: { model: AppModel }) => {
                 onPointerCancel={handleSwipePointerCancel}
             >
                 <PlayerBottomBarLayoutContext.Provider value={currentView === 'player'}>
-                    {shouldMountVisualizer && <VisualizerRenderer {...visualizerRendererModel} animateStyleSwitch />}
+                    {shouldMountVisualizer && <SceneHost {...visualizerRendererModel} songThemePair={songThemePair} animateStyleSwitch />}
                 </PlayerBottomBarLayoutContext.Provider>
+                {/* 视频平台的 MV 背景：铺在歌词样式之上（见该组件的文件头）。
+                    只在开关打开时自己挂出来，没开就是 null，不占任何东西。 */}
+                <BilibiliMvLayer />
+                {/* 歌本身就是一条投稿时，把它的画面铺上来（与上面那条 MV 匹配互不相干）。 */}
+                <BilibiliVideoStage />
             </div>
 
             <StageSessionEmptyState
@@ -700,6 +748,8 @@ const AppSurface = ({ model }: { model: AppModel }) => {
                 onClose={startupExperience.closeReleaseNotes}
             />
             <UserGuideModal theme={theme} />
+            {/* 限时活动弹窗：不在活动窗口内时它自己不渲染。 */}
+            <VipPromoModal theme={theme} />
             <AppUpdatePromptDialog
                 isOpen={updatePrompt.isPromptOpen}
                 isDaylight={isDaylight}

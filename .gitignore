@@ -60,6 +60,7 @@ plan/
 # Model weights: fetched and hash-verified by build/fetchModels.mjs, shipped in the installer,
 # never committed - 83MB that never changes does not belong in every clone's history.
 models/
+android/app/src/main/assets/models/
 build/windowtolayer
 build/windowtolayer-COPYING
 build/ffmpeg/
@@ -153,9 +154,19 @@ android/app/src/main/assets/capacitor.plugins.json
 .gemini/
 .claude/settings.local.json
 
+# Steam Audio libraries (build/fetchSteamAudio.mjs): from the pinned official SDK zip, shipped by extraResources.
+build/steam-audio/
 # 雾笺的笔顺数据（AnimCJK，Arphic Public License）不进仓库：构建时由 dev/nebbia/nebbiaStrokesPlugin.mjs 生成。
 # 旧做法手动放在 public/ 下的这份也不提交：插件生成的那份会盖住它，插件没生成时它不附授权文本
 public/nebbia-strokes.json
 
 # Generated system-WebView companions
 /build/apple-music-native/
+# Coven: the supervisor session's local ledger (packages/coven/README.md)
+.coven/
+# ignore workbuddy
+.workbuddy/
+HANDOFF.md
+dev/folia-find-damage.cjs
+dev/folia-merge-locale.cjs
+tsc-errors.txt

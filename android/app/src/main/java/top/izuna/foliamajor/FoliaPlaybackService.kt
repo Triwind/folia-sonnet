@@ -7,6 +7,9 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -113,6 +116,15 @@ class FoliaPlaybackService : android.app.Service() {
     private var cachedNotification: Notification? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val artworkDiskCache: ArtworkDiskCache by lazy {
+        ArtworkDiskCache.create(this) { op, error ->
+            Log.w(TAG, "[ArtworkDiskCache] $op failed", error)
+        }
+    }
+    private val artworkTracker = ArtworkFetchTracker { android.os.SystemClock.elapsedRealtime() }
+    private val artworkRetryLock = Any()
+    private var artworkRetryRunnable: Runnable? = null
+    private var artworkNetworkCallback: ConnectivityManager.NetworkCallback? = null
     /** 有一次「乐观播放」在等确认。 */
     private var playConfirmPending = false
     /** 那次乐观播放切的那一刻的位置：冻回去要落在这儿，不能落在已经被推出去的地方。 */
@@ -269,6 +281,7 @@ class FoliaPlaybackService : android.app.Service() {
         // 加回来继续播），那时没有机会问前台。
         applyLoopModeFromSettings()
         publishNotification()
+        registerArtworkNetworkCallback()
         // 壁纸心跳巡检开表（onDestroy 里撤）。服务在，巡检就在；它自己判断该不该敲。
         mainHandler.postDelayed(heartbeatTick, WALLPAPER_HEARTBEAT_TICK_MS)
     }
@@ -616,6 +629,19 @@ class FoliaPlaybackService : android.app.Service() {
         // 而服务已经存在时 onCreate 不会再跑（promoteToForeground 里那句「已前台就返回」
         // 让它几乎没有开销）。放在 action 判断里面的话，一条没带 action 的
         // startForegroundService 就永远等不到 startForeground()。
+        /*
+         * 无条件兑现一次前台化 —— 包括「标志位说已经在前台」的情形。
+         *
+         * 上面那道守卫（foregrounded 为真就返回）是为了省掉每秒搬 1 MB 封面 Bitmap 的开销，
+         * 但它默认「我说在前台就真的在前台」。实际情况不是这样：服务被销毁重建、
+         * 或某次 startForeground 失败之后，标志可能与系统的判定不一致 —— 而系统那边
+         * 一旦因为一条 startForegroundService 开了倒计时，**只有 startForeground() 能兑现**，
+         * 跳过就是 ForegroundServiceDidNotStartInTimeException 直接杀进程。
+         *
+         * 所以在每条启动命令上都真调一次：开销是每条 intent 一次，而不是每秒一次，
+         * 换来「后台放着放着突然没声音」这个崩溃不再发生。
+         */
+        foregrounded = false
         promoteToForeground()
         if (intent != null) {
             val action: String? = intent.getAction()
@@ -756,6 +782,8 @@ class FoliaPlaybackService : android.app.Service() {
         // 实例要没了：那次等确认的检查也跟着撤掉（它持着 this）。
         playConfirmPending = false
         mainHandler.removeCallbacks(playConfirmCheck)
+        cancelArtworkRetry()
+        unregisterArtworkNetworkCallback()
         // 心跳巡检也跟着撤：服务都死了，没人有资格替播放管线敲心跳。
         mainHandler.removeCallbacks(heartbeatTick)
         // 实例没了，前台状态必须跟着清：它是静态的，进程还在时插件靠它选
@@ -1751,9 +1779,8 @@ class FoliaPlaybackService : android.app.Service() {
         if (songChanged) {
             top.izuna.foliamajor.ai.BackgroundThemeWorker.updateActiveSong(songKey)
             cachedSongKey = songKey
-            cachedArtwork = null
+            resetArtworkStateForSongChange(songKey)
             cachedDurationMs = 0L
-            pendingArtworkUrl = null
             cachedLiked = false
             cachedCanLike = false
             cachedProviderId = ""
@@ -1835,8 +1862,10 @@ class FoliaPlaybackService : android.app.Service() {
         cachedSpeed = 1.0f
         // 自己就是「回话」：否则下一个计时器会再跳一首。
         lastMetadataAtMs = android.os.SystemClock.elapsedRealtime()
+        publishSnapshot()
         applyMetadata()
         applyPlaybackState()
+        publishNotification()
         promoteToForeground()
         syncWallpaperAnchor(true)
         val artworkUrl = entry.optString("artworkUrl", "")
@@ -1844,10 +1873,13 @@ class FoliaPlaybackService : android.app.Service() {
             // 叠层那份 WebView 的封面读的是地址（GLES 那层读 base64，下载完在
             // fetchArtwork 里补），通知栏那张也走这里。
             top.izuna.foliamajor.wallpaper.WallpaperLyricsState.setCoverUrl(artworkUrl)
-            if (artworkUrl != pendingArtworkUrl) {
-                pendingArtworkUrl = artworkUrl
-                fetchArtwork(artworkUrl)
-            }
+        }
+        if (!ArtworkRetryPolicy.isLocalOnlyUrl(artworkUrl)) {
+            // 只在真的换歌时才起请求（#383）：这首歌已经拿到过封面（含磁盘缓存命中）就什么都不做，
+            // 不然镜像每重装一次、每推一次 metadata 就会在同一条签名 URL 上再查一次盘 / 下一次。
+            if (songChanged) requestArtwork(artworkUrl, songKey)
+        } else if (songChanged) {
+            loadCachedArtworkForSong(songKey)
         }
         if (songChanged) {
             // 换歌先把上一首的时间轴清掉：拉不到词时也不能让壁纸继续唱旧歌。
@@ -1875,7 +1907,7 @@ class FoliaPlaybackService : android.app.Service() {
         }
         val title = cachedTitle
         val artist = cachedArtist
-        val artworkUrl = pendingArtworkUrl
+        val artworkUrl = artworkTracker.snapshotArtworkUrl().ifEmpty { null }
         BackgroundWork.io("native-lyric") {
             val lyric =
                     top.izuna.foliamajor.online.MusicGateway.fetchLyric(providerId, songId, mid, hash)
@@ -2041,14 +2073,13 @@ class FoliaPlaybackService : android.app.Service() {
         // 「这首歌没有封面」这两种情况都会让上一首的 Bitmap 一直挂着 —— 换歌那一刻 Web 层
         // 给的 base64 通常还是 null（封面要抓取 + 编码，慢一拍），通知栏就先画出上一首的
         // 封面，等下面按 URL 的下载跑完才换成当前歌。宁可中间没有大图，也不要错的图。
-        if (songKey != null && songKey != cachedSongKey) {
+        val songChanged = songKey != null && songKey != cachedSongKey
+        if (songChanged) {
             cachedSongKey = songKey
-            cachedArtwork = null
+            resetArtworkStateForSongChange(songKey)
             // 时长也一起清掉：metadata 现在是从缓存整体重建的（见 applyMetadata），
             // 不清的话「新歌还没带时长」会被填成上一首的时长。
             cachedDurationMs = 0L
-            // 让这次的 artworkUrl 能重新触发下载（同一个地址在同一首歌里只下一次）。
-            pendingArtworkUrl = null
             // 「喜欢」是**这首歌**的属性，换歌时不能沿用上一首的：Web 层这一次 update
             // 里带的就是新歌的值，所以先清、紧接着下面再按 extras 覆盖。
             cachedLiked = false
@@ -2106,16 +2137,29 @@ class FoliaPlaybackService : android.app.Service() {
         val artwork = decodeArtwork(artworkBase64)
         if (artwork != null) {
             cachedArtwork = artwork
+            // 带上 songKey：这首歌有封面了，之后同一条 update 再来就不该再起请求。
+            artworkTracker.onExternalArtworkLoaded(cachedSongKey)
+            if (ArtworkRetryPolicy.isLocalOnlyUrl(artworkUrl)) {
+                cacheBitmapForSongAsync(cachedSongKey, artwork)
+            }
         }
         publishSnapshot()
         applyMetadata()
 
-        // 封面优先走原生下载：Web 层用 fetch 抓远端封面常常被 CORS 挡掉，
+        // 封面优先走磁盘缓存，再走原生下载：Web 层用 fetch 抓远端封面常常被 CORS 挡掉，
         // 通知栏就只剩一个默认图标。原生侧没有同源限制，拿到再补一次通知。
-        if (artworkUrl != null && !artworkUrl.isEmpty()
-                && artworkUrl != pendingArtworkUrl) {
-            pendingArtworkUrl = artworkUrl
-            fetchArtwork(artworkUrl)
+        // blob: / data: 在这里就挡掉：它们只存在于 WebView 进程里，写进请求状态
+        // 会把去重标记占住，后面真正的 https 地址反而进不来（见 requestArtwork）。
+        if (!ArtworkRetryPolicy.isLocalOnlyUrl(artworkUrl)) {
+            // 已经拿到过封面（下载成功 / 磁盘命中 / 这次自带 base64）就什么都不做（#383）：
+            // 同一条 update 会随歌词、播放状态反复到达，签名 URL 还会整首周期性换一个，
+            // 每次都查盘 + HEAD + 写两份 + 两次全目录 trim 是白耗。真的起了一次请求、
+            // 还没拿到时，才顺手把磁盘里的旧封面先贴上。
+            if (requestArtwork(artworkUrl, cachedSongKey)) {
+                loadCachedArtworkForSong(cachedSongKey)
+            }
+        } else if (artwork == null && songChanged) {
+            loadCachedArtworkForSong(cachedSongKey)
         }
 
         // 已经贴出去的通知要再 post 一次才会带上新内容。
@@ -2151,40 +2195,240 @@ class FoliaPlaybackService : android.app.Service() {
     }
 
     /**
-     * 上一次已经发起下载的封面地址，避免同一首歌反复下载。
+     * 换歌时重置封面状态（#383）。
      *
-     * volatile：下载线程回来时要读它判断自己是不是已经过期了，而写发生在主线程。
+     * 同 songKey 再进来是同一首的又一次 update（重推 / 签名 URL 轮换 / 歌词到了重推），
+     * 什么都不重置：`cachedArtwork` 留着，tracker 也按「这一首已经有封面」继续拦去重。
+     *
+     * 只守着「这一首已经有封面」这一档，没封面时照样走一遍（tracker 对同歌也是空转）。
+     * `cachedArtwork != null` 这个附加条件是为了兜住「Bitmap 在、tracker 记的身份空着」的
+     * 老状态（服务重建后 Web 层先推 metadata 再报换歌）：那时 tracker 会重新认一次当前歌，
+     * 不把已经贴上的封面清掉。
      */
-    @Volatile
-    private var pendingArtworkUrl: String? = null
+    private fun resetArtworkStateForSongChange(songKey: String?) {
+        if (songKey != null && songKey == cachedSongKey && cachedArtwork != null) return
+        cancelArtworkRetry()
+        cachedArtwork = null
+        artworkTracker.onSongChanged(songKey)
+    }
 
-    private fun fetchArtwork(url: String) {
-        BackgroundWork.io("artwork") {
-            val bitmap = downloadBitmap(url)
-            // 下载期间可能已经切歌了：pendingArtworkUrl 已经换成新歌的地址，这张晚到的图要丢掉，
-            // 否则会把上一首的封面贴到当前歌上。
-            if (bitmap == null || url != pendingArtworkUrl) {
+    private fun cancelArtworkRetry() {
+        synchronized(artworkRetryLock) {
+            artworkRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+            artworkRetryRunnable = null
+        }
+    }
+
+    private fun scheduleArtworkRetry(plan: ArtworkFetchTracker.RetryPlan, songKey: String?) {
+        val runnable = Runnable {
+            if (!running || cachedArtwork != null) return@Runnable
+            val retryRequest = artworkTracker.beginScheduledRetry(plan) ?: return@Runnable
+            executeArtworkFetch(retryRequest, songKey)
+        }
+        synchronized(artworkRetryLock) {
+            artworkRetryRunnable?.let { mainHandler.removeCallbacks(it) }
+            artworkRetryRunnable = runnable
+            mainHandler.postDelayed(runnable, plan.delayMs)
+        }
+    }
+
+    private fun registerArtworkNetworkCallback() {
+        if (artworkNetworkCallback != null) return
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                mainHandler.post { retryMissingArtworkOnNetwork() }
+            }
+
+            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                if (networkCapabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
+                    mainHandler.post { retryMissingArtworkOnNetwork() }
+                }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(callback)
+            artworkNetworkCallback = callback
+        } catch (error: Throwable) {
+            Log.w(TAG, "Register artwork network callback failed", error)
+        }
+    }
+
+    private fun unregisterArtworkNetworkCallback() {
+        val callback = artworkNetworkCallback ?: return
+        artworkNetworkCallback = null
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        try {
+            cm.unregisterNetworkCallback(callback)
+        } catch (ignored: Throwable) {
+        }
+    }
+
+    /**
+     * 回前台时补一次封面（#309 / #348）。
+     *
+     * 只在**确实缺着**的时候动：有封面、本来就是 blob:/data:、或者已判定永久不可用都不再白跑。
+     * 重试计数一并清零，立刻尝试拉取（优先命中磁盘缓存）。
+     */
+    fun retryMissingArtwork() {
+        if (!running || cachedArtwork != null) return
+        val request = artworkTracker.canRecoverOnForeground() ?: return
+        cancelArtworkRetry()
+        Log.i(TAG, "Back in the foreground without artwork, fetching it again: ${coverHost(request.url)}")
+        executeArtworkFetch(request, cachedSongKey)
+    }
+
+    private fun retryMissingArtworkOnNetwork() {
+        if (!running || cachedArtwork != null) return
+        val request = artworkTracker.canRecoverOnNetwork() ?: return
+        cancelArtworkRetry()
+        Log.i(TAG, "Network available without artwork, retrying: ${coverHost(request.url)}")
+        executeArtworkFetch(request, cachedSongKey)
+    }
+
+    /**
+     * 请求封面：去重按 songKey 记（#383），同歌同 URL / 同歌换 URL 都不再重下一遍。
+     *
+     * @return true = 真的起了一次请求（调用方据此决定要不要去查磁盘缓存）；
+     *         false = 这一首已经有封面或已有请求在途，什么都不做。
+     */
+    private fun requestArtwork(url: String?, songKey: String?): Boolean {
+        val request = artworkTracker.beginRequest(url, songKey) ?: return false
+        cancelArtworkRetry()
+        executeArtworkFetch(request, songKey)
+        return true
+    }
+
+    private fun loadCachedArtworkForSong(songKey: String?) {
+        val cacheKey = ArtworkDiskCache.songKey(songKey) ?: return
+        val generation = artworkTracker.currentGeneration()
+        BackgroundWork.io("artwork-cache") {
+            val cachedBytes = artworkDiskCache.get(cacheKey) ?: return@io
+            val decoded = ArtworkDecoder.decodeSampled(cachedBytes)
+            if (decoded !is ArtworkLoad.Loaded) {
+                artworkDiskCache.remove(cacheKey)
                 return@io
             }
-            cachedArtwork = bitmap
-            publishSnapshot()
-            // 封面顺手喂给壁纸 GLES 层：它读的是 base64，WebView 冻结时 Web 抓
-            // base64 那条路不会跑，原生兜底切歌后的封面只能从这里来。
-            try {
-                val coverBuffer = java.io.ByteArrayOutputStream()
-                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, coverBuffer)
-                top.izuna.foliamajor.wallpaper.WallpaperLyricsState.setCoverData(
-                        android.util.Base64.encodeToString(coverBuffer.toByteArray(),
-                                android.util.Base64.NO_WRAP))
-            } catch (coverError: Throwable) {
-                Log.w(TAG, "Failed to feed the wallpaper cover", coverError)
+            mainHandler.post {
+                if (!running || generation != artworkTracker.currentGeneration() || cachedArtwork != null) {
+                    return@post
+                }
+                artworkTracker.onExternalArtworkLoaded(songKey)
+                applyLoadedArtwork(decoded.bitmap)
             }
-            // 封面补到了也顺手刷新一次 MediaSession：锁屏歌词页上的封面读的是 metadata，
-            // 只刷通知的话系统那边拿到的还是「没有封面」的那一份。
-            applyMetadata()
-            // 通知已经发出去了，要再 post 一次才会带上新封面。
-            publishNotification()
         }
+    }
+
+    private fun cacheBitmapForSongAsync(songKey: String?, bitmap: Bitmap) {
+        val cacheKey = ArtworkDiskCache.songKey(songKey) ?: return
+        BackgroundWork.bulk("artwork-cache-write") {
+            val bytes = encodeBitmapForCache(bitmap) ?: return@bulk
+            artworkDiskCache.put(cacheKey, bytes)
+        }
+    }
+
+    private fun tryDeliverFromDiskCache(cacheKey: String?, request: ArtworkFetchTracker.FetchRequest): Boolean {
+        if (cacheKey == null) return false
+        val cachedBytes = artworkDiskCache.get(cacheKey) ?: return false
+        val decoded = ArtworkDecoder.decodeSampled(cachedBytes)
+        if (decoded is ArtworkLoad.Loaded) {
+            deliverLoadedArtwork(request, decoded.bitmap)
+            return true
+        }
+        artworkDiskCache.remove(cacheKey)
+        return false
+    }
+
+    private fun deliverLoadedArtwork(request: ArtworkFetchTracker.FetchRequest, bitmap: Bitmap) {
+        mainHandler.post {
+            if (!running || !artworkTracker.onFetchSucceeded(request)) return@post
+            cancelArtworkRetry()
+            applyLoadedArtwork(bitmap)
+        }
+    }
+
+    private fun executeArtworkFetch(request: ArtworkFetchTracker.FetchRequest, songKey: String?) {
+        val targetSongKey = songKey ?: ""
+        BackgroundWork.io("artwork") {
+            val urlCacheKey = ArtworkDiskCache.urlKey(request.url)
+            if (tryDeliverFromDiskCache(urlCacheKey, request)) {
+                return@io
+            }
+
+            when (val download = downloadArtworkBytes(request.url)) {
+                is ArtworkDownload.Permanent -> {
+                    mainHandler.post {
+                        artworkTracker.onFetchPermanentFailure(request)
+                        Log.i(TAG, "Artwork is unusable, not retrying: ${download.reason}")
+                    }
+                }
+                is ArtworkDownload.Bytes -> {
+                    when (val decoded = ArtworkDecoder.decodeSampled(download.bytes)) {
+                        is ArtworkLoad.Loaded -> {
+                            // 两套键存的字节不一样（#383）：`url:` 是这一次网络尝试的原始字节，
+                            // 源图不超过阈值时原样存；`song:` 只服务通知栏尺寸，一律按 512px 解码结果
+                            // 重编码，命中它的人拿到的就是通知栏那张图（见 ArtworkDiskCache.songKey）。
+                            val rawBytes = if (ArtworkDiskCache.keepsRawBytes(download.bytes.size)) download.bytes else null
+                            val sampledBytes = if (rawBytes != null) rawBytes else encodeBitmapForCache(decoded.bitmap)
+                            urlCacheKey?.let { key ->
+                                if (rawBytes != null) artworkDiskCache.put(key, rawBytes)
+                            }
+                            if (sampledBytes != null) {
+                                ArtworkDiskCache.songKey(targetSongKey)?.let { artworkDiskCache.put(it, sampledBytes) }
+                            }
+                            deliverLoadedArtwork(request, decoded.bitmap)
+                        }
+                        is ArtworkLoad.Permanent -> {
+                            mainHandler.post {
+                                artworkTracker.onFetchPermanentFailure(request)
+                                Log.i(TAG, "Artwork is unusable, not retrying: ${decoded.reason}")
+                            }
+                        }
+                        ArtworkLoad.Transient -> handleTransientArtworkFailure(request, targetSongKey)
+                    }
+                }
+                ArtworkDownload.Transient -> handleTransientArtworkFailure(request, targetSongKey)
+            }
+        }
+    }
+
+    private fun handleTransientArtworkFailure(request: ArtworkFetchTracker.FetchRequest, targetSongKey: String) {
+        if (tryDeliverFromDiskCache(ArtworkDiskCache.songKey(targetSongKey), request)) {
+            // 磁盘命中要真的走「成功」这条路（#383）：否则 tracker 里那条请求一直算在途，
+            // 这一首再也起不了新请求，回前台 / 网络恢复的补拉也全被挡住。
+            mainHandler.post {
+                if (!running || !artworkTracker.onFetchSucceeded(request)) return@post
+                cancelArtworkRetry()
+            }
+            return
+        }
+        mainHandler.post {
+            if (!running) return@post
+            val plan = artworkTracker.onFetchTransientFailure(request) ?: return@post
+            Log.i(TAG, "Artwork not fetched, retry #${plan.attemptNumber} in ${plan.delayMs}ms: ${coverHost(plan.url)}")
+            scheduleArtworkRetry(plan, targetSongKey)
+        }
+    }
+
+    private fun applyLoadedArtwork(bitmap: Bitmap) {
+        cachedArtwork = bitmap
+        publishSnapshot()
+        // 封面顺手喂给壁纸 GLES 层：它读的是 base64，WebView 冻结时 Web 抓
+        // base64 那条路不会跑，原生兜底切歌后的封面只能从这里来。
+        try {
+            val coverBuffer = java.io.ByteArrayOutputStream()
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, coverBuffer)
+            top.izuna.foliamajor.wallpaper.WallpaperLyricsState.setCoverData(
+                    android.util.Base64.encodeToString(coverBuffer.toByteArray(),
+                            android.util.Base64.NO_WRAP))
+        } catch (coverError: Throwable) {
+            Log.w(TAG, "Failed to feed the wallpaper cover", coverError)
+        }
+        // 封面补到了也顺手刷新一次 MediaSession：锁屏歌词页上的封面读的是 metadata，
+        // 只刷通知的话系统那边拿到的还是「没有封面」的那一份。
+        applyMetadata()
+        // 通知已经发出去了，要再 post 一次才会带上新封面。
+        publishNotification()
     }
 
     private fun updatePlaybackState(intent: Intent) {
@@ -2281,9 +2525,18 @@ class FoliaPlaybackService : android.app.Service() {
                     cachedArtist = entry.artist; cachedAlbum = entry.album
                     cachedProviderId = entry.providerId; cachedServerSongId = entry.songId
                     cachedLiked = false; cachedCanLike = false
-                    cachedArtwork = null; pendingArtworkUrl = null
+                    resetArtworkStateForSongChange(entry.songKey)
                     mirroredIndex = playQueue.all().indexOf(entry); playQueue.seekTo(mirroredIndex)
-                    if (entry.coverUrl.isNotEmpty()) { pendingArtworkUrl = entry.coverUrl; fetchArtwork(entry.coverUrl) }
+                    // 镜像里的封面地址同样可能还是页面内的 blob（见 requestArtwork）：
+                    // 别让它占住去重标记，也别为它起一次注定失败的下载。
+                    if (!ArtworkRetryPolicy.isLocalOnlyUrl(entry.coverUrl)) {
+                        // 换成这一首的那一拍才请求；这一首已经有封面（含磁盘命中）就不再重下（#383）。
+                        if (requestArtwork(entry.coverUrl, entry.songKey)) {
+                            loadCachedArtworkForSong(entry.songKey)
+                        }
+                    } else {
+                        loadCachedArtworkForSong(entry.songKey)
+                    }
                     nativeLyrics.clear(entry.songKey)
                 }
             }
@@ -2373,7 +2626,8 @@ class FoliaPlaybackService : android.app.Service() {
             val comma = base64.indexOf(',')
             val payload = if (comma >= 0) base64.substring(comma + 1) else base64
             val bytes = Base64.decode(payload, Base64.DEFAULT)
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            // 同样按目标尺寸采样解码（#352）：Web 交下来的 data URL 也可能是超大原图。
+            return (ArtworkDecoder.decodeSampled(bytes) as? ArtworkLoad.Loaded)?.bitmap
         } catch (error: Throwable) {
             // 封面解析失败不该影响播放与通知，退回默认图标即可。
             Log.w(TAG, "Failed to decode artwork", error)
@@ -2540,6 +2794,18 @@ class FoliaPlaybackService : android.app.Service() {
          */
         @JvmStatic
         fun isForegrounded(): Boolean {
+            /*
+             * 实例已经不在（onDestroy 走过 / 进程被重建）时不能报 true。
+             *
+             * 这个标志是**静态**的：它跟着类走，不跟着实例走。服务被销毁、进程还在
+             * （用户从最近任务划掉、系统杀掉服务但保住进程）之后，它还留着 true ——
+             * 插件于是改走普通 startService（不开 5 秒倒计时），可新起来的实例
+             * onCreate 里 promoteToForeground() 又会因为「已前台」直接返回……
+             * 两头一对，谁都没兑现，系统 5 秒后抛
+             * ForegroundServiceDidNotStartInTimeException 把进程带走。
+             * 用户看到的就是「后台放着放着突然没声音，打开 App 报这个错」。
+             */
+            if (!running) return false
             return foregrounded
         }
 
@@ -2576,7 +2842,7 @@ class FoliaPlaybackService : android.app.Service() {
                     out.put("canLike", service.cachedCanLike)
                     out.put("providerId", service.cachedProviderId)
                     out.put("serverSongId", service.cachedServerSongId)
-                    out.put("artworkUrl", service.pendingArtworkUrl ?: "")
+                    out.put("artworkUrl", service.artworkTracker.snapshotArtworkUrl())
                 } catch (ignored: org.json.JSONException) {
                 }
             }
@@ -2629,6 +2895,7 @@ class FoliaPlaybackService : android.app.Service() {
                 var songKey = service.cachedSongKey ?: ""
                 var positionMs = service.resolvePlaybackPositionMs()
                 var fromDisk = false
+                var positionSavedAtMs = 0L
                 /*
                  * 服务起来了但队列是空的（通知栏那颗播放键把服务拉起来、还没有歌）：
                  * 同样回落到盘上那份，否则前台以为「原生什么都没有」而丢掉一段能恢复的会话。
@@ -2640,6 +2907,7 @@ class FoliaPlaybackService : android.app.Service() {
                         index = disk.optInt("index", index)
                         songKey = disk.optString("songKey", songKey)
                         positionMs = disk.optLong("positionMs", positionMs)
+                        positionSavedAtMs = disk.optLong("positionSavedAtMs", 0L)
                         fromDisk = true
                     }
                 }
@@ -2661,8 +2929,16 @@ class FoliaPlaybackService : android.app.Service() {
                 out.put("canLike", service.cachedCanLike)
                 out.put("providerId", service.cachedProviderId)
                 out.put("serverSongId", service.cachedServerSongId)
-                out.put("artworkUrl", service.pendingArtworkUrl ?: "")
-                if (fromDisk) out.put("fromDisk", true)
+                /*
+                 * 合并（#348 与 #349/#350）：
+                 *   · 封面地址以 artworkTracker 为准 —— #425 把「当前该用哪张封面」收进了 tracker；
+                 *   · positionSavedAtMs 是 dev 上 #350 加的（Service 重建后会用它判断位置新旧），保留。
+                 */
+                out.put("artworkUrl", service.artworkTracker.snapshotArtworkUrl())
+                if (fromDisk) {
+                    out.put("fromDisk", true)
+                    out.put("positionSavedAtMs", positionSavedAtMs)
+                }
                 // nativeMedia / lyrics 只在真有值时才带（歌词拉完才给，空串也算拉完）。
                 NativeLyricPresentation.attach(out, service.nativeLyrics, service.cachedSongKey)
             }
@@ -2705,6 +2981,7 @@ class FoliaPlaybackService : android.app.Service() {
                 put("album", current?.optString("album", "") ?: "")
                 put("durationMs", current?.optLong("durationMs", 0L) ?: 0L)
                 put("positionMs", snapshot.positionMs)
+                put("positionSavedAtMs", snapshot.positionSavedAtMs)
                 put("playing", false)
                 put("liked", current?.optBoolean("liked", false) ?: false)
                 put("canLike", current?.optBoolean("canLike", false) ?: false)
@@ -2975,40 +3252,93 @@ class FoliaPlaybackService : android.app.Service() {
             return if (info.durationMs > 0L) Math.min(advanced, info.durationMs) else advanced
         }
 
-        private fun downloadBitmap(url: String): Bitmap? {
+        /** 最多读 [limit] 字节；超过返回 null（不把半截数据当图）。 */
+        private fun readAtMost(stream: java.io.InputStream, limit: Int): ByteArray? {
+            val out = java.io.ByteArrayOutputStream()
+            val buffer = ByteArray(16 * 1024)
+            var total = 0
+            while (true) {
+                val read = stream.read(buffer)
+                if (read < 0) break
+                total += read
+                if (total > limit) return null
+                out.write(buffer, 0, read)
+            }
+            return out.toByteArray()
+        }
+
+        /** 日志里只留主机名：封面地址常带签名参数，不进日志（AGENTS：凭据不进日志）。 */
+        private fun coverHost(url: String): String =
+            try { java.net.URL(url).host } catch (ignored: Throwable) { "?" }
+
+        private sealed class ArtworkDownload {
+            class Bytes(val bytes: ByteArray) : ArtworkDownload()
+            class Permanent(val reason: String) : ArtworkDownload()
+            object Transient : ArtworkDownload()
+        }
+
+        private fun encodeBitmapForCache(bitmap: Bitmap): ByteArray? = try {
+            val out = java.io.ByteArrayOutputStream()
+            val format = if (bitmap.hasAlpha()) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val quality = if (format == Bitmap.CompressFormat.PNG) 100 else 90
+            if (bitmap.compress(format, quality, out)) out.toByteArray() else null
+        } catch (error: OutOfMemoryError) {
+            Log.w(TAG, "[ArtworkDiskCache] Not enough memory to encode the cover", error)
+            null
+        } catch (error: Exception) {
+            Log.w(TAG, "[ArtworkDiskCache] Could not encode the cover", error)
+            null
+        }
+
+        private fun downloadArtworkBytes(url: String): ArtworkDownload {
+            /*
+             * blob: / data: 只有 WebView 自己认，原生这里没有这条协议。
+             *
+             * 切歌时 Web 层交下来的封面地址常常是页面内的 blob（封面已经抓下来、正在缓存里），
+             * 直接丢给 java.net.URL 就是一次 MalformedURLException：日志里刷一条
+             * "unknown protocol: blob"，封面照样拿不到，只是把「没图」伪装成「下载失败」。
+             * 这两种地址本来就不可能从原生这条路过，看到就安静返回，免得掩盖真正的网络错误。
+             * 它们也不可能重试成功，按永久失败处理。
+             */
+            if (ArtworkRetryPolicy.isLocalOnlyUrl(url)) {
+                return ArtworkDownload.Permanent("local-only scheme")
+            }
+            var connection: java.net.HttpURLConnection? = null
             var stream: java.io.InputStream? = null
             try {
-                val connection =
-                        java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                connection = java.net.URL(url).openConnection() as java.net.HttpURLConnection
                 connection.setConnectTimeout(6000)
                 connection.setReadTimeout(10000)
                 connection.setInstanceFollowRedirects(true)
                 connection.setRequestProperty("User-Agent", "Mozilla/5.0")
                 val code = connection.getResponseCode()
                 if (code < 200 || code >= 300) {
-                    connection.disconnect()
-                    return null
+                    // 4xx（除了 408 / 429）是地址本身的问题：重试没有意义；5xx / 超时 / 限流才值得退避。
+                    val permanent = code in 400..499 && code != 408 && code != 429
+                    Log.w(TAG, "Cover request failed: HTTP $code from ${coverHost(url)}")
+                    return if (permanent) ArtworkDownload.Permanent("HTTP $code") else ArtworkDownload.Transient
+                }
+                // 声明的长度已经超限就不读了（#352）：省掉一次必败的下载。
+                val declared = connection.getContentLengthLong()
+                if (declared > ArtworkSampling.MAX_ARTWORK_BYTES) {
+                    val reason = "declared size $declared exceeds ${ArtworkSampling.MAX_ARTWORK_BYTES}"
+                    Log.w(TAG, "Cover skipped: $reason (${coverHost(url)})")
+                    return ArtworkDownload.Permanent(reason)
                 }
                 stream = connection.getInputStream()
-                val decoded = android.graphics.BitmapFactory.decodeStream(stream)
-                connection.disconnect()
-                if (decoded == null) {
-                    return null
+                // 先把字节读进内存（带上限），再按目标尺寸采样解码：通知栏只要一张小图，
+                // 整张解码再缩放的峰值是整图像素的好几倍，超大封面会 OOM 并被当成「没有封面」。
+                val bytes = readAtMost(stream, ArtworkSampling.MAX_ARTWORK_BYTES)
+                if (bytes == null) {
+                    val reason = "body exceeds ${ArtworkSampling.MAX_ARTWORK_BYTES} bytes"
+                    Log.w(TAG, "Cover skipped: $reason (${coverHost(url)})")
+                    return ArtworkDownload.Permanent(reason)
                 }
-                // 通知栏只需要一张小图，顺手压到 512，避免大图白占内存。
-                val edge = Math.max(decoded.getWidth(), decoded.getHeight())
-                if (edge > 512) {
-                    val ratio = 512f / edge
-                    val scaled = android.graphics.Bitmap.createScaledBitmap(decoded,
-                            Math.round(decoded.getWidth() * ratio),
-                            Math.round(decoded.getHeight() * ratio), true)
-                    decoded.recycle()
-                    return scaled
-                }
-                return decoded
+                return ArtworkDownload.Bytes(bytes)
             } catch (error: Throwable) {
-                Log.w(TAG, "Failed to download the cover", error)
-                return null
+                // 网络层的异常（超时、断线、DNS）：临时失败，走退避重试。
+                Log.w(TAG, "Failed to download the cover from ${coverHost(url)}", error)
+                return ArtworkDownload.Transient
             } finally {
                 if (stream != null) {
                     try {
@@ -3016,6 +3346,12 @@ class FoliaPlaybackService : android.app.Service() {
                     } catch (ignored: java.io.IOException) {
                         // 关闭失败不影响结果。
                     }
+                }
+                // 任何路径（含读取中途抛异常）都收掉连接，不留半开的 socket。
+                try {
+                    connection?.disconnect()
+                } catch (ignored: Throwable) {
+                    // 已经断开就算了。
                 }
             }
         }
@@ -3043,6 +3379,8 @@ class FoliaPlaybackService : android.app.Service() {
                 "lxmusic" -> return R.drawable.ic_provider_lxmusic
                 // Apple Music（v0.7.27 上游新增）：官方图标去色后的白色剪影。
                 "appleMusic" -> return R.drawable.ic_provider_applemusic
+                // 视频平台：小电视的白色剪影（同样是 alpha-only 的 smallIcon）。
+                "bilibili" -> return R.drawable.ic_provider_bilibili
                 else -> return R.mipmap.ic_launcher
             }
         }

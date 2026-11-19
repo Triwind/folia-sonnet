@@ -1,4 +1,5 @@
 import { defineCommand } from '../commandFactories';
+import { openPerfCheck } from '../../perfCheck/openPerfCheck';
 import { backgroundPickerSurface, visualizerPickerSurface } from '../surfaces/pickerSurface';
 import { Camera, LayoutGrid, Wallpaper } from 'lucide-react';
 import type { CommandPaletteCommand } from '../types';
@@ -94,7 +95,8 @@ export const visualizerCommands: CommandPaletteCommand[] = [
     createToggleCommand('smart-beat-off', 'visualizer', 'Smart beat mode: Off', 'Turn the beat effects off; every picture as it was', [...SMART_BEAT_KEYWORDS, 'off', '关闭', '关'], context => context.visualizer.setSmartBeatMode('off')),
     createToggleCommand('smart-beat-cached', 'visualizer', 'Smart beat mode: Analysed only', 'Play the beat effects from tracks already analysed only; smart beat itself analyses nothing new and leaves the GPU alone (automix is not affected)', [...SMART_BEAT_KEYWORDS, 'cached', 'cache only', 'analysed only', '只用已分析', '缓存', '半开'], context => context.visualizer.setSmartBeatMode('cached')),
     createToggleCommand('smart-beat-on', 'visualizer', 'Smart beat mode: On', 'Play the beat effects, analysing a track not analysed yet on the GPU', [...SMART_BEAT_KEYWORDS, 'on', '开启', '开', '全开'], context => context.visualizer.setSmartBeatMode('on')),
-    ...VISUALIZER_REGISTRY.flatMap(({ mode, command }) => (
+    // 隐藏的款式（mv）不生成切换命令 —— 它的家在壁纸背景模式里。
+    ...VISUALIZER_REGISTRY.filter(({ hiddenFromPickers }) => !hiddenFromPickers).flatMap(({ mode, command }) => (
         command ? [createVisualizerCommand(mode, command.title, command.description, command.keywords)] : []
     )),
     // 町景的取景控制条（machi/MachiCameraBar.tsx）：只在播放页、正在画町景时有；打开时收起侧边面板，让出画面。
@@ -165,6 +167,15 @@ export const visualizerCommands: CommandPaletteCommand[] = [
         ['lyric freeze', 'freeze fix', 'linux', 'glow', 'fd leak', 'stepped glow', '歌词卡死', '动画卡死', '画面定格', '发光半径分档', '发光', 'faguangbanjing', 'fgbj'],
         context => context.visualizer.toggleGlowBlurQuantize(),
     ),
+    defineCommand({
+        id: 'perf-check-run',
+        group: 'visualizer',
+        title: 'Run the performance check',
+        description: 'Measure the frame rate of a lyric style with the analysis running, and try the frame-rate cap, canvas resolution and anti-aliasing',
+        keywords: ['performance check', 'benchmark', 'fps', 'frame rate', 'lag', 'stutter', '性能检测', '跑分', '帧率', '卡顿', '测试性能'],
+        platform: ['electron'],
+        execute: () => openPerfCheck(),
+    }),
     createToggleCommand('visualizer-toggle-random-per-song', 'visualizer', 'Random visualizer for every song', 'Toggle a random lyric animation mode whenever the song changes', ['random visualizer', 'random animation', 'per song', '随机歌词动画', '每首歌随机动画'], context => context.visualizer.toggleRandomVisualizerModePerSong()),
     {
         id: 'background-monet-full-overlay',

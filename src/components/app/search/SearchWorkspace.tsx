@@ -12,6 +12,9 @@ import {
     useSearchNavigationStore,
 } from '../../../stores/useSearchNavigationStore';
 import SearchResultsList from './SearchResultsList';
+import { usePlaybackStore, selectDisplaySong } from '../../../stores/usePlaybackStore';
+import { getSongArtistLabel } from '../../../services/onlineMusic/songMetadata';
+import { songKeyOf } from '../../bilibili/BilibiliMvLayer';
 import SearchComposition from './SearchComposition';
 import SearchTabs, { useSearchSourceLabel } from './SearchTabs';
 import { useCollectionNavigationStore } from '../../../stores/useCollectionNavigationStore';
@@ -31,6 +34,8 @@ type SearchWorkspaceProps = {
     theme: Theme;
     isDaylight: boolean;
     onClose: () => void;
+    /** 退掉压在搜索结果之上的一层（歌单 / 专辑）。安卓返回键在搜索页里要靠它逐层返回（#411）。 */
+    onBackCollection: () => void;
     onSubmitSearch: (source?: SearchSource, kind?: SearchKind) => void;
     onLoadMore: () => void;
     onPlayTrack: (track: UnifiedSong) => void;
@@ -53,12 +58,18 @@ const PLACEHOLDER_KEYS: Record<SearchKind, string> = {
     song: 'search.placeholder',
     album: 'search.placeholderAlbum',
     playlist: 'search.placeholderPlaylist',
+    // 视频站那几档；音乐平台不会选中它们，取不到时用通用的那句。
+    video: 'search.placeholderVideo',
+    bangumi: 'search.placeholderBangumi',
+    movie: 'search.placeholderMovie',
+    user: 'search.placeholderUser',
 };
 
 const SearchWorkspace: React.FC<SearchWorkspaceProps> = ({
     theme,
     isDaylight,
     onClose,
+    onBackCollection,
     onSubmitSearch,
     onLoadMore,
     onPlayTrack,
@@ -110,9 +121,35 @@ const SearchWorkspace: React.FC<SearchWorkspaceProps> = ({
         return resolveTrackDisplay ? raw.map(resolveTrackDisplay) : raw;
     }, [resolveTrackDisplay, searchResults]);
     const collections = collectionResults || [];
-    const isCollectionKind = searchKind !== 'song';
+    /*
+     * 哪些种类摆的是「集合」（专辑 / 歌单 / 番剧 / 电影 / 用户），哪些摆的是「单曲」。
+     *
+     * 不能写成 `kind !== 'song'`：视频站的「视频」那一档和单曲是同一条路
+     * （executeSearch 把 'video' 也交给 searchOnlineProviderSongs，见那边的注释），
+     * 结果落在 searchResults 里。以前这里把 'video' 当集合，界面就去读
+     * collectionResults —— 永远是空的，表现成「视频这一档什么都搜不出来」，
+     * 而同一个词在番剧 / 电影 / 用户那几档都正常。
+     */
+    const isCollectionKind = searchKind === 'album'
+        || searchKind === 'playlist'
+        || searchKind === 'bangumi'
+        || searchKind === 'movie'
+        || searchKind === 'user';
     const resultCount = isCollectionKind ? collections.length : results.length;
     const { sources, activeProviderId } = useSearchSources(hasLocalSongs);
+    // B 站那一栏要「把视频钉到正在放的这首歌」：从播放器取当前歌，拼成 songKey。
+    const displaySong = usePlaybackStore(selectDisplaySong);
+    const currentSongKey = useMemo(() => {
+        if (!displaySong) return '';
+        const name = (displaySong as { name?: string }).name ?? '';
+        const artist = getSongArtistLabel(displaySong as never) || '';
+        return songKeyOf(name, artist);
+    }, [displaySong]);
+    // 钉好之后退出搜索：用户点的是「看这个视频」，不该还停在结果里。
+    // onClose 就是「关搜索回主界面」，在播放页上发起搜索时回去正好是播放页。
+    const onOpenPlayerAfterPin = useCallback(() => {
+        onClose();
+    }, [onClose]);
     const kinds = useMemo(() => getSearchKinds(searchSourceTab), [searchSourceTab]);
     const hasCollection = useCollectionNavigationStore(state => Boolean(state.snapshot?.stack.length));
     const getSourceLabel = useSearchSourceLabel();
@@ -136,16 +173,26 @@ const SearchWorkspace: React.FC<SearchWorkspaceProps> = ({
     }, [activeProviderId, isSearchOpen, onSubmitSearch, sources, submittedQuery]);
 
     useEffect(() => {
-        if (!isSearchOpen || hasCollection) return;
+        if (!isSearchOpen) return;
+        /*
+         * 安卓返回键（#411）：它派发的是一个 Escape，**有人消费才算关掉一层**，没人消费就退到后台。
+         *
+         * 原来这里是 `if (!isSearchOpen || hasCollection) return` —— 打开一张歌单 / 专辑之后
+         * 搜索页就不接管 Escape 了，于是返回键直接退到后台（用户看到的正是「返回键把 App 杀了」），
+         * 而不是先退回搜索结果。现在分两层：
+         *   · 压在搜索结果之上（hasCollection）：退掉那一层，搜索页留着；
+         *   · 已经在搜索结果上：关掉搜索页。
+         * 两层都要 preventDefault，让 useNativeBackButton 认为这次按键被消费掉。
+         */
         const handleKeyDown = (event: KeyboardEvent) => {
-            if (event.key === 'Escape') {
-                event.preventDefault();
-                onClose();
-            }
+            if (event.key !== 'Escape') return;
+            event.preventDefault();
+            if (hasCollection) onBackCollection();
+            else onClose();
         };
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [hasCollection, isSearchOpen, onClose]);
+    }, [hasCollection, isSearchOpen, onBackCollection, onClose]);
 
     return (
         <AnimatePresence>

@@ -7,12 +7,19 @@ import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
 
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 
+import top.izuna.foliamajor.automix.AutomixLoad
 import top.izuna.foliamajor.player.dsp.AudioPipelineTelemetry
 import top.izuna.foliamajor.player.dsp.EqSettings
+import top.izuna.foliamajor.player.dsp.InstrumentalCoordinator
+import top.izuna.foliamajor.player.dsp.InstrumentalStore
 import top.izuna.foliamajor.player.dsp.NativeEqualizerState
+import top.izuna.foliamajor.player.dsp.VocalTrackMode
+import top.izuna.foliamajor.player.dsp.vocalTrackModeOf
+import top.izuna.foliamajor.player.dsp.shouldSwapVocalTrack
 import top.izuna.foliamajor.settings.FoliaSettingsStore
 import top.izuna.foliamajor.wallpaper.WallpaperLyricsState
 import top.izuna.foliamajor.player.transition.bridge.TransitionDeckHost
@@ -41,9 +48,48 @@ class FoliaNativePlayerPlugin : Plugin() {
 
     @Volatile
     private var player: FoliaNativePlayer? = null
+    /** 本插件实例建播放器时拿到的代数；旧实例的事件与释放回调靠它识别自己已被取代（#314）。 */
+    @Volatile
+    private var playerGeneration = 0L
+
+    /** 在播放器线程换源前撤销旧媒体的缓冲豁免；代数过期（插件已被新实例取代）时不碰全局状态。 */
+    private fun prepareClearingStall(target: FoliaNativePlayer, url: String, startPositionMs: Long, mediaId: String?, sourceToken: String? = null) {
+        val generation = playerGeneration
+        target.prepare(
+            url,
+            startPositionMs,
+            mediaId,
+            sourceToken = sourceToken,
+            onPlayerThreadBeforePrepare = { PLAYER_GENERATIONS.runIfCurrent(generation) { WallpaperLyricsState.clearPlayerStall() } },
+        )
+    }
+
+    /** 释放播放器：先让排队中的旧事件失效（player=null），释放完成后再清全局缓冲豁免，且只在代数仍是当前时清。 */
+    private fun releasePlayerAndClearStall() {
+        val generation = playerGeneration
+        val current = player
+        player = null
+        if (current != null) {
+            current.release {
+                PLAYER_GENERATIONS.runIfCurrent(generation) { WallpaperLyricsState.clearPlayerStall() }
+            }
+        } else {
+            PLAYER_GENERATIONS.runIfCurrent(generation) { WallpaperLyricsState.clearPlayerStall() }
+        }
+    }
+
+    /** 当前这首的 songKey。伴奏缓存键、以及「生成完是不是还在听这首」都靠它。 */
+    @Volatile
+    private var currentSongKey: String? = null
 
     companion object {
+        /** 跨插件实例共享：新实例 load() 一旦推进代数，旧实例的任何迟到写入都被挡掉。 */
+        private val PLAYER_GENERATIONS = PlayerGeneration()
+
         private const val EVENT = "foliaNativePlayer"
+
+        /** 「设置 → 存储」里「预先拆分音轨」总开关在原生设置 blob 里的键。 */
+        private const val PREBUILD_TRACKS_KEY = "prebuildTracks"
 
         /** 过桥回到主线程用（播放器那条线程不能直接碰监听器表）。 */
         private val MAIN = Handler(Looper.getMainLooper())
@@ -79,6 +125,9 @@ class FoliaNativePlayerPlugin : Plugin() {
             val playing: Boolean,
             val speed: Float,
             val buffering: Boolean,
+            val sourceToken: String?,
+            /** 对外的原始地址：伴奏/清唱时 [url] 是本地 file:// 轨，这里仍是平台给的原地址。 */
+            val baseUrl: String? = null,
         ) {
             fun toJson(): org.json.JSONObject = org.json.JSONObject().apply {
                 put("songKey", songKey)
@@ -88,6 +137,8 @@ class FoliaNativePlayerPlugin : Plugin() {
                 put("playing", playing)
                 put("speed", speed.toDouble())
                 put("buffering", buffering)
+                put("sourceToken", sourceToken)
+                if (!baseUrl.isNullOrEmpty()) put("baseUrl", baseUrl)
             }
         }
 
@@ -112,20 +163,22 @@ class FoliaNativePlayerPlugin : Plugin() {
                 player.isPlaying(),
                 player.getSpeed(),
                 player.isBuffering(),
+                player.currentResumeSourceToken(),
+                // 只在伴奏/清唱轨时带原始地址：交叉淡化等换源只改 lastUrl、不刷新 baseUrl，普通轨带它会指向上一首。
+                if (player.isOnInstrumental()) player.baseUrl() else null,
             )
         }
 
         /** 亮屏/叠层低频核对只改显示锚点，绝不 seek 或重新 prepare 真播放器（#174）。 */
         @JvmStatic
         fun refreshDisplayAnchor() {
-            val owner = instance ?: return
-            val current = owner.player ?: return
-            current.sampleDisplayAnchor { positionMs, playing ->
-                if (instance !== owner || owner.player !== current) return@sampleDisplayAnchor
-                val snapshot = WallpaperLyricsState.get()
-                if (displayAnchorNeedsWrite(snapshot.playing, snapshot.positionMs(), playing, positionMs)) {
-                    WallpaperLyricsState.setAnchor(positionMs, playing)
-                }
+            val media = mediaSnapshot() ?: return
+            val playing = playerAudible(media.playing, media.buffering)
+            // 不用 media.positionMs：那是上一拍的采样，后台一秒才一拍，直接比会把锚点往回拽（#320）。
+            val positionMs = instance?.player?.getDisplayPositionMs(playing) ?: media.positionMs
+            val snapshot = WallpaperLyricsState.get()
+            if (displayAnchorNeedsWrite(snapshot.playing, snapshot.positionMs(), playing, positionMs)) {
+                WallpaperLyricsState.setAnchor(positionMs, playing)
             }
         }
 
@@ -169,7 +222,7 @@ class FoliaNativePlayerPlugin : Plugin() {
              */
             val url = top.izuna.foliamajor.FoliaPlaybackService.mirrorCurrentUrl()
             if (url.isNullOrEmpty()) return
-            player.prepare(url, currentPositionMs())
+            current.prepareClearingStall(player, url, currentPositionMs(), null)
             player.play()
         }
 
@@ -184,7 +237,7 @@ class FoliaNativePlayerPlugin : Plugin() {
             val current = instance
             val player = current?.player
             if (current == null || player == null || url == null || url.isEmpty()) return false
-            player.prepare(url, -1L, mediaId)
+            current.prepareClearingStall(player, url, -1L, mediaId)
             return true
         }
 
@@ -302,6 +355,10 @@ class FoliaNativePlayerPlugin : Plugin() {
 
     override fun load() {
         instance = this
+        val generation = PLAYER_GENERATIONS.advance()
+        playerGeneration = generation
+        // 旧实例若还没销毁，它的释放回调会因代数过期而跳过清理；新播放器从干净的缓冲豁免开始。
+        WallpaperLyricsState.clearPlayerStall()
         /*
          * 均衡器先恢复再建播放器。
          *
@@ -309,14 +366,71 @@ class FoliaNativePlayerPlugin : Plugin() {
          * 那一下的声音也要按用户上次的听感走。顺序反了第一首就是默认曲线。
          */
         NativeEqualizerState.restore(FoliaSettingsStore.get(getContext()))
+        /*
+         * 「关闭人声」的伴奏缓存：绑进度回调 + 扫一遍残留。
+         *
+         * 扫盘走后台线程：cacheDir 里可能有上百个文件，主线程上做一次目录遍历
+         * 不算贵，但也没必要在启动路径上占那几毫秒。
+         */
+        InstrumentalCoordinator.notify = { state, percent ->
+            val event = JSObject()
+            event.put("state", state)
+            event.put("percent", percent)
+            MAIN.post { notifyListeners("instrumental", event) }
+        }
+        /*
+         * 「切回全部时手上的原曲地址可能已经过期，请重新解析一个」。
+         *
+         * 原生不认识任何音乐平台，重新要地址只能由 Web 侧（omni）来。这条事件只带
+         * 这一首的身份，Web 侧确认还是当前这首之后走正常的音源恢复路径 —— 拿到新地址
+         * 就装源，装完播放器自然在「全部」上。少了这一段，切回全部就是一个读不出来的源
+         * （本地又没有缓存）—— 用户听到的是没有声音，界面却显示「全部」。
+         */
+        InstrumentalCoordinator.requestFreshSource = { songKey, reason ->
+            val event = JSObject()
+            event.put("songKey", songKey)
+            event.put("reason", reason)
+            MAIN.post { notifyListeners("sourceReload", event) }
+        }
+        val appContext = context.applicationContext
+        Thread { InstrumentalCoordinator.sweep(appContext) }.apply {
+            isDaemon = true
+            name = "folia-instrumental-sweep"
+        }.start()
         // load() 在主线程上跑，但播放器自己会起一条专用线程（见 FoliaNativePlayer
         // 文件头的「线程」那一节）—— 这里只是把壳子建出来。
         player = FoliaNativePlayer(getContext(), object : FoliaNativePlayer.Listener {
             override fun onEvent(type: String, positionMs: Long, durationMs: Long, message: String?) {
+                // 旧实例（已释放或已被新 load() 取代）排队中的事件不得写全局桌面歌词状态。
+                val self = player
+                if (self == null || !PLAYER_GENERATIONS.isCurrent(generation)) return
                 /*
                  * ⚠️ 这一下是**播放器线程**上跑的（播放循环在那条专用线程上，见
                  * FoliaNativePlayer 文件头的「线程」那一节），不在主线程。
                  */
+                /*
+                 * 先把「是不是在等数据」交给桌面歌词（#314），再写下面的锚点。
+                 *
+                 * 缓冲时下面那段会把快照写成 playing=false（时间轴该停住，这没错），而叠层的
+                 * 「暂停时隐藏」只认这一个布尔值：网络一卡，动画停 3.5 秒后整层淡出，缓冲完再
+                 * 淡回来。这一份让它分得清「用户暂停」和「在等数据」。每条事件都报（含 buffering /
+                 * error / idle 这些不写锚点的），值由播放器在发事件前按真值算好。
+                 */
+                WallpaperLyricsState.setPlayerStalled(self.isStalled())
+                /*
+                 * 播放负载闸门：把「现在在不在出声」喂给分析线程的让路器（AutomixLoad）。
+                 * 后台的分离 / 预分析看到它在播，就把每个推理窗口的大头时间让给
+                 * 解码与 AudioTrack —— 不让的话，推理线程满负荷抢占，正在放的歌
+                 * 一卡一卡，歌词就对不上曲子。这里只写一个 volatile，position 那些高频
+                 * 事件直接跳过。
+                 */
+                if ("position" != type) {
+                    AutomixLoad.playbackAudible = when (type) {
+                        "playing" -> true
+                        "paused", "ended", "error", "idle" -> false
+                        else -> player?.isPlaying() == true
+                    }
+                }
                 /*
                  * 桌面歌词（壁纸 / 悬浮小窗 / 锁屏）的时间轴锚点：由播放器自己给，
                  * **就在这里写**，不再绕一次主线程 —— 锚点记的是「收到这个位置的那一刻」，
@@ -329,10 +443,9 @@ class FoliaNativePlayerPlugin : Plugin() {
                      * seeked 既可能是播放中的单曲循环，也可能是暂停时拖进度条：
                      * 不能用「不是 paused 就算在播」推，问播放器自己。
                      */
-                    val playing = if ("seeked" == type)
-                        player != null && player!!.isPlaying()
-                    else
-                        "paused" != type && player?.isBuffering() != true
+                    // READY 只表示已有可播放源，不表示已经出声；统一读取播放器线程缓存的真值，
+                    // 避免暂停发生在 READY 之前时被 ready 事件误写回 playing=true。
+                    val playing = anchorPlayingForEvent(type, self.isPlayingOnPlayerThread())
                     /*
                      * ⭐ **"position" 这一档不是每次都写锚点。**
                      *
@@ -367,7 +480,7 @@ class FoliaNativePlayerPlugin : Plugin() {
                      * 抽一下」。倍速时不跳过，照旧每拍写（跟改之前一样），不引入回归。
                      * 真要把倍速也抹平，得让 WallpaperLyricsState 的外推带上速率。
                      */
-                    val unityRate = player != null && Math.abs(player!!.getSpeed() - 1f) < 0.01f
+                    val unityRate = Math.abs(self.getSpeed() - 1f) < 0.01f
                     val snapshot = WallpaperLyricsState.get()
                     if ("position" == type && playing && unityRate
                         && !displayAnchorNeedsWrite(snapshot.playing, snapshot.positionMs(), playing, positionMs)) {
@@ -407,11 +520,25 @@ class FoliaNativePlayerPlugin : Plugin() {
                 payload.put("type", type)
                 payload.put("positionMs", positionMs.toDouble())
                 payload.put("durationMs", durationMs.toDouble())
+                /*
+                 * ⭐ 这一下在**什么时候**发生的。
+                 *
+                 * `positionMs` 是生成这一刻的位置，而这个 payload 要排到主线程、再进
+                 * WebView 的 JS 上下文，才轮到 `nativePlaybackEngine.apply()` 记基准。
+                 * 队列一忙（起播那一瞬间正好在铺歌词、换封面、切视觉器），这一段就是
+                 * 几百毫秒 —— 而 Web 侧原来拿**收到**的时刻当基准，时钟从这以后就整首
+                 * 歌落后那么多，歌词看着永远比声音晚，且只在原生这一路（安卓）出现。
+                 *
+                 * 两边读的是同一个系统时钟（`System.currentTimeMillis()` 与 JS 的
+                 * `Date.now()`），所以 Web 侧拿 `Date.now() - wallMs` 就能算出这段过桥
+                 * 耗时，再把基准退回去，位置才是「此刻真的在播到哪」。
+                 */
+                payload.put("wallMs", System.currentTimeMillis().toDouble())
                 // ended / error 用事件发出时真实装着的那首（见 FoliaNativePlayer.emit），不用已被下一单提前改写的 lastMediaId。
-                val eventKey = if ("ended" == type || "error" == type) player?.lastEventMediaId() ?: "" else player?.currentMediaId() ?: ""
+                val eventKey = if ("ended" == type || "error" == type) self.lastEventMediaId() else self.currentMediaId()
                 payload.put("songKey", eventKey)
-                payload.put("playing", player?.isPlaying() == true)
-                payload.put("buffering", player?.isBuffering() == true)
+                payload.put("playing", self.isPlaying())
+                payload.put("buffering", self.isBuffering())
                 /*
                  * ⭐ **播完了自动下一首。**
                  *
@@ -511,15 +638,30 @@ class FoliaNativePlayerPlugin : Plugin() {
         }
         // 插件加载顺序不保证：过渡插件可能比播放器插件先起来。播放器就绪后在这里补挂引擎。
         TransitionRuntime.attachIfNeeded { transitionHost() }
+        /*
+         * 「这条源读不出来」→ 把本机那份缓存副本删掉。
+         *
+         * 媒体缓存命中的判据只有「文件在不在」，一份写坏的副本会永远命中、永远报错
+         * （用户看到「播放错误 → 暂停 → 继续播放没声音」，切分离也因为解码同一个坏源
+         * 立刻失败）。删掉之后下一次取源回到网络。
+         *
+         * 删除要那份缓存所在的目录，只有插件这边的 server 实例知道；播放器只负责
+         * 在「错误属于源本身读不出来」时叫这一声（见 FoliaNativePlayer.isSourceUnreadable）。
+         */
+        player?.onUnreadableSource = { url ->
+            try {
+                top.izuna.foliamajor.LocalAudioServer.dropBrokenMediaCacheFor(url)
+            } catch (error: Throwable) {
+                android.util.Log.w("FoliaNativePlayer", "drop unreadable cache failed", error)
+            }
+        }
     }
 
     override fun handleOnDestroy() {
-        val current = player
-        if (current != null) {
-            current.release()
-            player = null
-        }
-        instance = null
+        // 先使排队中的旧播放器事件失效，再异步释放播放器线程；清理只在代数仍是当前时生效。
+        releasePlayerAndClearStall()
+        // 旧实例迟到销毁时不能把新实例的入口一并清掉。
+        if (instance === this) instance = null
         super.handleOnDestroy()
     }
 
@@ -534,6 +676,7 @@ class FoliaNativePlayerPlugin : Plugin() {
         val startPositionMs = call.getDouble("startPositionMs")
         val repeatMode = call.getInt("repeatMode")
         val webSongKey = call.getString("songKey")
+        val sourceToken = call.getString("sourceToken")
         if (repeatMode != null) {
             current.setRepeatMode(repeatMode)
         }
@@ -547,6 +690,9 @@ class FoliaNativePlayerPlugin : Plugin() {
         if (url != current.currentUrl() &&
             FoliaTransitionPlugin.tryTakeover(context, url, webSongKey)
         ) {
+            // 过渡接管时这台播放器不接 Web 的装源，伴奏换源也就无从谈起：
+            // 把还在跑的生成任务作废，别让它在半路把歌切走。
+            InstrumentalCoordinator.cancel()
             MAIN.post { top.izuna.foliamajor.FoliaPlaybackService.activeService()?.onWebPrepared(webSongKey) }
             val handled = JSObject()
             handled.put("ok", true)
@@ -556,13 +702,55 @@ class FoliaNativePlayerPlugin : Plugin() {
         }
         // 撤销条件：Web 亲自装源 = 手动换歌，进行中的过渡必须让位并恢复播放器状态。
         FoliaTransitionPlugin.interrupt("Web 亲自装源")
-        current.prepare(
-            url,
-            if (startPositionMs != null) startPositionMs.toLong() else -1L,
-            webSongKey,
-        )
+        /*
+         * 「关闭人声」开着、而且这首已经生成过伴奏：一次就装伴奏。
+         *
+         * 不先装原曲再切 —— 那会多一次解码器初始化，启播时听得出一下顿。
+         * 装伴奏时 MediaItem 的 mediaId 仍然是这首歌的 songKey，
+         * 通知栏 / 桌面歌词 / 镜像兜底都以为没换过东西。
+         */
+        val activeMode = NativeEqualizerState.activeMode()
+        val cachedTrack = activeMode?.let { mode ->
+            InstrumentalStore.find(context, InstrumentalStore.keyFor(url, webSongKey), mode)
+        }
+        if (cachedTrack != null) {
+            current.prepareInstrumental(
+                url,
+                Uri.fromFile(cachedTrack).toString(),
+                if (startPositionMs != null) startPositionMs.toLong() else -1L,
+                webSongKey,
+                sourceToken,
+            )
+        } else {
+            // 旧媒体的缓冲豁免不能跨媒体继承：清理排到播放器线程、与旧事件同序，换源前旧事件无法再写回。
+            prepareClearingStall(current, url, if (startPositionMs != null) startPositionMs.toLong() else -1L, webSongKey, sourceToken)
+        }
         // Web 亲自装源 = 原生那一单派发作废，服务的 pending 换成 Web 选的这首（#182 审查 M2）。
         MAIN.post { top.izuna.foliamajor.FoliaPlaybackService.activeService()?.onWebPrepared(webSongKey) }
+        currentSongKey = webSongKey
+        /*
+         * 记下「原曲是这一刻装的」：切回全部时用它判断手上那条地址放了多久
+         * （见 InstrumentalCoordinator.sourceMayBeStale）。放在装源之后，与
+         * currentSongKey 一起写，两者才会描述同一首歌。
+         */
+        InstrumentalCoordinator.noteSourcePrepared()
+        /*
+         * 开关开着的话：这首歌要是有现成的那一轨就直接换过去，没有就开始生成。
+         * reconcile 内部会先把旧任务作废（generation +1），不会串到上一首。
+         */
+        InstrumentalCoordinator.reconcile(context, current, url, webSongKey)
+        /*
+         * 提前拆音轨由「设置 → 存储」里的总开关说了算。
+         *
+         * 关着（默认）：只正常给智能动感提供数据，不预先跑 SCNet 拆两轨 ——
+         * 那是几十秒的推理，用户没点头就别占着播放的核。等他真拨了「伴奏 /
+         * 清唱」，reconcile 会自己现拆。
+         * 开着：装完源就把这首歌的两轨备好，拨开关秒切；下一首由 Web 的
+         * 预取队列提前备（songAssetPrecompute.ts）。
+         */
+        if (FoliaSettingsStore.get(context).getBoolean(PREBUILD_TRACKS_KEY, false)) {
+            InstrumentalCoordinator.prebuild(context, url, webSongKey)
+        }
         val result = JSObject()
         result.put("ok", true)
         call.resolve(result)
@@ -614,6 +802,24 @@ class FoliaNativePlayerPlugin : Plugin() {
         }
         current.seek(positionMs.toLong())
         call.resolve()
+    }
+
+    @PluginMethod
+    fun seekForResume(call: PluginCall) {
+        val current = player
+        val position = call.getDouble("positionMs")
+        val songKey = call.getString("songKey")
+        val token = call.getString("sourceToken")
+        if (current == null || position == null || songKey.isNullOrEmpty() || token.isNullOrEmpty()) {
+            call.reject("A player, positionMs, songKey and sourceToken are required.")
+            return
+        }
+        current.seekForResume(position.toLong(), songKey, token) { outcome ->
+            outcome.fold(
+                { applied -> call.resolve(JSObject().apply { put("ok", applied); put("stale", !applied) }) },
+                { error -> call.reject("Resume seek failed", Exception(error)) },
+            )
+        }
     }
 
     @PluginMethod
@@ -719,11 +925,196 @@ class FoliaNativePlayerPlugin : Plugin() {
      * 只改一个 volatile 布尔值，音频线程下一帧就照它处理，
      * 不重建音频链、不重新加载音频 —— 所以拨开关是即时的。
      * 具体算法见 player/dsp/VocalCancelProcessor.kt。
+     *
+     * 同时落盘：冷启动时可能是通知栏 / 锁屏先把播放拉起来，那时 WebView 还没起来、
+     * 没人来推这个开关，只能靠播放器 load() 里的 restore 读回来。
      */
     @PluginMethod
     fun setVocalCancelEnabled(call: PluginCall) {
-        NativeEqualizerState.vocalCancelEnabled = call.getBoolean("enabled", false) ?: false
+        val enabled = call.getBoolean("enabled", false) ?: false
+        NativeEqualizerState.setVocalCancelEnabled(
+            FoliaSettingsStore.get(getContext()),
+            enabled,
+        )
+        val current = player
+        InstrumentalCoordinator.reconcile(context, current, current?.baseUrl(), currentSongKey)
         call.resolve()
+    }
+
+    /**
+     * 开关「只留人声」（清唱轨）。与 [setVocalCancelEnabled] 互斥，
+     * 互斥由 NativeEqualizerState 保证，界面不需要自己关另一个。
+     */
+    @PluginMethod
+    fun setVocalOnlyEnabled(call: PluginCall) {
+        val enabled = call.getBoolean("enabled", false) ?: false
+        NativeEqualizerState.setVocalOnlyEnabled(
+            FoliaSettingsStore.get(getContext()),
+            enabled,
+        )
+        val current = player
+        InstrumentalCoordinator.reconcile(context, current, current?.baseUrl(), currentSongKey)
+        call.resolve()
+    }
+
+    /**
+     * 三态「全部 / 人声 / 伴奏」的原子切换。
+     *
+     * 界面上那一行三选一只调这一个方法：两个互斥布尔一次落定、**只 reconcile 一次**。
+     * 旧的两个 setter 保留给命令面板与冷启动对表（它们各自只拨一个开关）。
+     *
+     * 之前 Web 侧把一次切换拆成两条独立的桥调用，每条都各自 reconcile：切「全部」
+     * 时先关伴奏的那一发里清唱还开着，播放器当场被换到清唱轨；第二条才换回原曲，
+     * 中间那一跳用户听得见，两条命令再乱序一次就停在错轨上 —— 正是「切人声放的是
+     * 全部、切全部放的是人声」。原子接口从根上消掉中间态。
+     */
+    @PluginMethod
+    fun setVocalTrackMode(call: PluginCall) {
+        val mode = vocalTrackModeOf(call.getString("mode"))
+        NativeEqualizerState.setVocalTrackMode(FoliaSettingsStore.get(getContext()), mode)
+        val current = player
+        InstrumentalCoordinator.reconcile(context, current, current?.baseUrl(), currentSongKey)
+        call.resolve()
+    }
+
+    /**
+     * 「设置 → 存储」里「删除人声分离缓存」。
+     *
+     * 清的是原生 cacheDir/instrumental 下那两轨 m4a 文件，不是 Web 侧 IndexedDB 的
+     * 分析曲线。删完把新的用量一起回给界面，省得再问一次 getInstrumentalState。
+     */
+    @PluginMethod
+    fun clearSeparationCache(call: PluginCall) {
+        /*
+         * 删除缓存是一次「回到全部」的重置，不是只删文件：
+         *   · 先把模式退回全部（两个互斥开关一次落定、落盘）；
+         *   · 正在播分离轨时把音源换回原曲，再删文件 —— 少了这一步，ExoPlayer
+         *     脚下正读的那个 m4a 被抽走，当场断音甚至报错；
+         *   · 不重新发起分离：删完还开着「人声 / 伴奏」会立刻又生成一份，
+         *     用户看到的就是「删了又自己长出来」，界面还会一直挂在 building 0%。
+         */
+        NativeEqualizerState.setVocalTrackMode(FoliaSettingsStore.get(getContext()), null)
+        val current = player
+        val base = current?.baseUrl()
+        if (current != null && base != null && current.isOnInstrumental()
+            && shouldSwapVocalTrack(current.currentUrl(), base)
+        ) {
+            current.swapSource(base, instrumental = false)
+        }
+        InstrumentalCoordinator.clear(context.applicationContext)
+        val (usedBytes, usedCount, limitBytes) = InstrumentalStore.usage()
+        val result = JSObject()
+        result.put("ok", true)
+        result.put("mode", "off")
+        result.put("usedBytes", usedBytes)
+        result.put("usedCount", usedCount)
+        result.put("limitBytes", limitBytes)
+        call.resolve(result)
+    }
+
+    /**
+     * 提前分析：把这首歌的两轨伴奏 / 清唱先备好，不换源。
+     *
+     * Web 侧的预取（下一首、队列变化）会调它；装源时原生自己也会调一次，
+     * 所以这里重复调用是安全的：同一首歌正在跑或已经备好就直接返回。
+     */
+    @PluginMethod
+    fun prepareSongTracks(call: PluginCall) {
+        val url = call.getString("url")
+        val songKey = call.getString("songKey")
+        // 双保险：Web 侧的总开关已经在预取队列那里 gate 过一次，这里再挡一道，
+        // 免得将来有别的地方直接调这个插件方法绕过开关。
+        if (!url.isNullOrBlank() && FoliaSettingsStore.get(context).getBoolean(PREBUILD_TRACKS_KEY, false)) {
+            InstrumentalCoordinator.prebuild(context, url, songKey)
+        }
+        val result = JSObject()
+        result.put("ok", true)
+        call.resolve(result)
+    }
+
+    /**
+     * 「设置 → 存储」里「预先拆分音轨」总开关。
+     *
+     * 落原生设置 blob 而不只留在 WebView：通知栏 / 锁屏先把播放拉起来时 WebView
+     * 还没起来，装源那条路（prepare）得自己知道要不要预拆。默认关。
+     */
+    @PluginMethod
+    fun setPrebuildTracksEnabled(call: PluginCall) {
+        val enabled = call.getBoolean("enabled", false) ?: false
+        FoliaSettingsStore.get(context).put(PREBUILD_TRACKS_KEY, enabled)
+        val result = JSObject()
+        result.put("ok", true)
+        call.resolve(result)
+    }
+
+    /**
+     * 「关闭人声」此刻的状态。
+     *
+     * state: idle / building / ready / failed；percent 只在 building 时有意义。
+     * 与 getEqualizerState 一样是**按需问**，不轮询：界面只在那一页开着时才需要它。
+     */
+    @PluginMethod
+    fun getInstrumentalState(call: PluginCall) {
+        val (state, percent, key) = InstrumentalCoordinator.status()
+        val (usedBytes, usedCount, limitBytes) = InstrumentalStore.usage()
+        val current = player
+        val currentKey = current?.let {
+            InstrumentalStore.keyFor(it.baseUrl().orEmpty(), currentSongKey)
+        }
+        val mode = NativeEqualizerState.activeMode()
+        /*
+         * 这首歌的两轨是不是已经在盘上。
+         *
+         * 「分离过的歌重放还显示正在分析」多半不是真在重跑模型，而是 Coordinator
+         * 的状态在关开关 / 切歌时被归零了：缓存明明齐了，界面却从 0% 起。
+         * 直接问一次盘，齐了就诚实报 ready（正在生成中的那趟仍以它自己的进度为准）。
+         */
+        val cachedReady = currentKey != null && InstrumentalStore.bothReady(context, currentKey)
+        val stateForUi = if (cachedReady && mode != null && state != InstrumentalCoordinator.STATE_BUILDING)
+            InstrumentalCoordinator.STATE_READY else state
+        val result = JSObject()
+        result.put("state", stateForUi)
+        result.put("percent", if (stateForUi == InstrumentalCoordinator.STATE_READY) 100 else percent)
+        result.put("key", key)
+        /*
+         * 这条状态是不是「此刻正在播的这首歌」的。
+         *
+         * 切歌后 Coordinator 可能还留着上一首的 building / ready，Web 侧拿它显示
+         * 进度就会把上一首的旧数据当成新歌的（「切下一首却用上一首的数据」）。
+         * 缓存已就绪时状态本来就该归当前歌，不必等 Coordinator 那一趟回来。
+         */
+        result.put("forCurrent", cachedReady || (key != null && key == currentKey))
+        // 缓存用量：界面用它显示「已缓存 12 首 · 46 MB」，上限跟着磁盘剩余走。
+        result.put("usedBytes", usedBytes)
+        result.put("usedCount", usedCount)
+        result.put("limitBytes", limitBytes)
+        // 此刻生效的是伴奏、清唱还是都没有：界面据此显示不同的说明。
+        result.put("mode", when (mode) {
+            VocalTrackMode.INSTRUMENTAL -> "instrumental"
+            VocalTrackMode.VOCAL -> "vocal"
+            null -> "off"
+        })
+        /*
+         * 播放器此刻**真的**装的是哪一轨：original / instrumental / vocal / none。
+         *
+         * mode 只表示用户的意图（开关），换源是异步的，两者短时间可能不一致。
+         * 把它回给界面，用来把「看起来切了其实没切」的选中态纠正过来，
+         * 也是排查「错位」时最该看的一个数。
+         */
+        val currentUrl = current?.currentUrl()
+        val instrumentalUrl = currentKey?.let {
+            Uri.fromFile(InstrumentalStore.targetFor(context, it, VocalTrackMode.INSTRUMENTAL)).toString()
+        }
+        val vocalUrl = currentKey?.let {
+            Uri.fromFile(InstrumentalStore.targetFor(context, it, VocalTrackMode.VOCAL)).toString()
+        }
+        result.put("currentTrack", when {
+            currentUrl == null -> "none"
+            currentUrl == instrumentalUrl -> "instrumental"
+            currentUrl == vocalUrl -> "vocal"
+            else -> "original"
+        })
+        call.resolve(result)
     }
 
     /**
@@ -809,10 +1200,7 @@ class FoliaNativePlayerPlugin : Plugin() {
 
     @PluginMethod
     fun release(call: PluginCall) {
-        val current = player
-        if (current != null) {
-            current.release()
-        }
+        releasePlayerAndClearStall()
         call.resolve()
     }
 }

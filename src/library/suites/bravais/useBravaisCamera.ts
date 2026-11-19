@@ -12,8 +12,8 @@ import {
 } from '../../../components/wall/wallView';
 import type { WallCameraRange } from '../../../components/wall/finiteWall';
 import { BRAVAIS_CAMERA_TWEEN_S, BRAVAIS_CULL_EDGE_MARGIN, BRAVAIS_OVERSCAN, getBravaisScale } from './bravaisConstants';
-import { rubberBand } from './bravaisFiniteWall';
 import { useLatticeSettingsStore, WALL_ZOOM_MAX, WALL_ZOOM_MIN } from '../../../stores/useLatticeSettingsStore';
+import { rubberBand } from './bravaisFiniteWall';
 import { computeBravaisFrame, getTiltReach } from './bravaisFrame';
 import type { BravaisFrameState } from './useBravaisFrame';
 import { seamBoundsOf } from './bravaisAnchor';
@@ -31,14 +31,25 @@ const area = (bounds: Bounds) => (bounds.right - bounds.left) * (bounds.bottom -
 /**
  * 当前可见的世界范围（缝张开时两半各让出半个开口，左右再放宽一个开口宽；横的缝放宽上下）。倾斜时再按反转回去的视口放宽
  * （getTiltReach）：支点跟着缝走，缝拖远了视口会整块偏开，不能只靠 overscan 兜着。
+ * 翻牌 / 入场的范围、第一次按方向键的落点这些「在不在屏上」的判断也用它（不按缝放宽时给 seam: false）。
+ * center 缺省是此刻的视图中心；给别的中心就是「相机到了那里时」的可见范围（补间的目的地、拖动与滚轮的下一步）——
+ * 这几处也得按倾斜算：缝在远处时倾斜的视口整块偏开，按没倾斜的范围预留，飞行途中墙是空的；按没倾斜的范围判断
+ * 「快到边缘」，每一帧都会重新裁剪。
  */
-export const getVisibleWorldBounds = (state: BravaisFrameState): Bounds | null => {
+export const getVisibleWorldBounds = (
+    state: BravaisFrameState,
+    center: WallViewCenter = state.center,
+    { seam = true, overscan = 0 }: { /** 按缝的开口放宽（缺省放宽）。 */ seam?: boolean; /** 四周再多算的世界距离。 */ overscan?: number } = {},
+): Bounds | null => {
     const { view } = state;
     if (!view) return null;
-    const bounds = getViewWorldBounds(state.center, view, seamBoundsOf(state));
+    const flat = getViewWorldBounds(center, view, { ...(seam ? seamBoundsOf(state) : {}), overscan });
+    // 倾斜着换锚点时垫的那一段（两半墙在屏幕上多挪了 tiltLiftY，看到的世界范围反着挪）。
+    const lift = state.anchorX === null ? 0 : state.tiltLiftY / view.scale;
+    const bounds = lift === 0 ? flat : { ...flat, top: flat.top - lift, bottom: flat.bottom - lift };
     if (Math.abs(state.tiltDeg) < 0.001 || state.anchorX === null) return bounds;
     const { tilt } = computeBravaisFrame({
-        center: state.center,
+        center,
         view,
         anchorX: state.anchorX,
         openWidth: state.openWidth,
@@ -54,6 +65,24 @@ export const getVisibleWorldBounds = (state: BravaisFrameState): Bounds | null =
         top: bounds.top - reach.top / view.scale,
         bottom: bounds.bottom + reach.bottom / view.scale,
     };
+};
+
+/**
+ * 翻牌、整墙波次与入场量的两个范围：视口本身（不按缝放宽；波次与入场从它的左上角量）和「会动的那一片」（按缝放宽、再外扩
+ * overscan；之外的磁贴直接换、不翻）。都是倾斜后的可见范围——缝在远处时倾斜的视口整块偏开，按没倾斜的算，屏上的磁贴会被
+ * 当成屏外的硬切。
+ */
+export const getFlipRanges = (state: BravaisFrameState, overscan: number): { viewport: Bounds; visible: Bounds } | null => {
+    const viewport = getVisibleWorldBounds(state, undefined, { seam: false });
+    const visible = getVisibleWorldBounds(state, undefined, { overscan });
+    return viewport && visible ? { viewport, visible } : null;
+};
+
+/** 此刻在屏上的 slot（第一次按方向键从它们里挑离缝最近的）：同样按倾斜后的可见范围。 */
+export const filterOnScreenSlots = <Slot extends { x: number; y: number; width: number; height: number }>(state: BravaisFrameState, slots: readonly Slot[]): Slot[] => {
+    const visible = getVisibleWorldBounds(state, undefined, { seam: false });
+    if (!visible) return [];
+    return slots.filter(slot => slot.x < visible.right && slot.x + slot.width > visible.left && slot.y < visible.bottom && slot.y + slot.height > visible.top);
 };
 
 /** 可见范围离已裁剪范围的边缘还剩不到一截 overscan 时才需要重新裁剪。 */
@@ -77,7 +106,10 @@ export const useBravaisCamera = ({
     fieldRef: RefObject<HTMLDivElement | null>;
     reducedMotion: boolean;
 }) => {
-    // 已裁剪（渲染了 slot）的可见范围；墙渲染它外扩 overscan 的 slot。
+    // 缩放倍率交回 store（与播放页磁贴墙共用一份，跨会话保留）。
+    // 缩放倍率交回 store（与播放页磁贴墙共用一份，跨会话保留）。
+    // 只读它来给 zoom 宿主取基准，写回只在捏合落定那一次（onZoomEnd）—— 途中不写 store。
+    const setWallZoom = useLatticeSettingsStore(state => state.handleSetWallZoom);
     const [bounds, setBounds] = useState<Bounds | null>(null);
     const boundsRef = useRef<Bounds | null>(null);
     boundsRef.current = bounds;
@@ -86,11 +118,6 @@ export const useBravaisCamera = ({
     // useWallPointerPan 读写的是 Lattice 形状的平移相机：每次移动都同步它。
     const cameraRef = useRef<LatticeCamera>({ x: 0, y: 0, scale: 1 });
     const viewportRef = useRef({ width: 1, height: 1 });
-    // 性能优先：补间途中只保留目的地那一屏（预留得越多，world 层被重画的面积越大）。
-    const performanceMode = useLatticeSettingsStore(state => state.latticePerformanceMode);
-    const reservedViewports = performanceMode ? 1 : MAX_RESERVED_VIEWPORTS;
-    // 用户的缩放倍率（双指捏合 / Ctrl+滚轮，与 Lattice 共用一份）。
-    const setWallZoom = useLatticeSettingsStore(state => state.handleSetWallZoom);
 
     const syncPointerCamera = useCallback(() => {
         const { view, center } = frameRef.current;
@@ -138,9 +165,8 @@ export const useBravaisCamera = ({
         stopCamera();
         const from = { ...frameRef.current.center };
         if (Math.abs(target.x - from.x) < 0.5 && Math.abs(target.y - from.y) < 0.5) return;
-        const view = frameRef.current.view;
-        if (view) {
-            const destination = getViewWorldBounds(target, view, seamBoundsOf(frameRef.current));
+        const destination = getVisibleWorldBounds(frameRef.current, target);
+        if (destination) {
             setBounds(current => {
                 if (!current) return destination;
                 const merged = {
@@ -149,8 +175,7 @@ export const useBravaisCamera = ({
                     top: Math.min(current.top, destination.top),
                     bottom: Math.max(current.bottom, destination.bottom),
                 };
-                // 性能优先：飞行途中只保留目的地那一屏（预留得越多，world 层被重画的面积越大）。
-                return area(merged) > area(destination) * reservedViewports ? destination : merged;
+                return area(merged) > area(destination) * MAX_RESERVED_VIEWPORTS ? destination : merged;
             });
         }
         if (reducedMotion || duration <= 0) {
@@ -173,7 +198,7 @@ export const useBravaisCamera = ({
                 moveTo(target, true);
             },
         });
-    }, [frameRef, moveTo, reducedMotion, renderFrame, reservedViewports, stopCamera, syncPointerCamera]);
+    }, [frameRef, moveTo, reducedMotion, renderFrame, stopCamera, syncPointerCamera]);
 
     // B7 有限拼贴的相机范围：拖动中超出范围按阻尼走（弹性），惯性与滚轮硬钳制，松手后补间回范围里。
     const rangeRef = useRef<WallCameraRange | null>(null);
@@ -206,20 +231,24 @@ export const useBravaisCamera = ({
         if (range && settleNow) settle();
     }, [settle]);
 
-    // 拖动与滚轮：wall 的 hook 交回平移相机，换算成视图中心再走同一条 moveTo。
-    // 缩放（捏合 / Ctrl+滚轮）：hook 交回来的 scale 先写进帧状态（真源是视图中心，缩放是 view 的一档），
-    // 再用它换算视图中心 —— 两边用同一个 scale，捏住的世界点才不会飘。
+    /**
+     * 拖动、滚轮与捏合：wall 的 hook 交回平移相机，位置换算成视图中心再走同一条 moveTo。
+     *
+     * ★ 倍率必须一起接过来（#409）。以前这里只取位置：
+     *     moveTo(constrain(viewCenterFromCamera(next, view)), ...)
+     * 于是 useWallPointerPan 的 zoomAt 改了 next.scale，这里当场丢掉 —— 捏合算得再对画面也不缩，
+     * 用户看到的就是「双指彻底没反应」。Bravais 的倍率真源是 view.scale（useBravaisViewport 由
+     * wallZoom 乘出来的），所以缩放变化要写回 store，再由 viewport 那一层重新出 scale。
+     */
     const applyCamera = useCallback((next: LatticeCamera, updateBounds?: boolean) => {
         const view = frameRef.current.view;
         if (!view) return;
-        const scaled = Math.abs(next.scale - view.scale) > 1e-4 ? { ...view, scale: next.scale } : view;
-        if (scaled !== view) frameRef.current.view = scaled;
-        moveTo(constrain(viewCenterFromCamera(next, scaled)), Boolean(updateBounds));
+        moveTo(constrain(viewCenterFromCamera(next, view)), Boolean(updateBounds));
     }, [constrain, frameRef, moveTo]);
     const getWorldBounds = useCallback((camera: LatticeCamera) => {
         const view = frameRef.current.view;
         if (!view) return { left: 0, right: 0, top: 0, bottom: 0 };
-        return getViewWorldBounds(viewCenterFromCamera(camera, view), view, seamBoundsOf(frameRef.current));
+        return getVisibleWorldBounds(frameRef.current, viewCenterFromCamera(camera, view)) ?? { left: 0, right: 0, top: 0, bottom: 0 };
     }, [frameRef]);
     const pointer = useWallPointerPan({
         applyCamera,
@@ -228,19 +257,39 @@ export const useBravaisCamera = ({
         containerRef: fieldRef,
         reducedMotion,
         overscan: BRAVAIS_OVERSCAN,
+        // 与 needsRecull 用同一个边距，拖动这边才和宿主判「要不要重裁」时按同一个数走（#427）。
+        cullEdgeMargin: BRAVAIS_CULL_EDGE_MARGIN,
         bounds: bounds ?? { left: 0, right: 0, top: 0, bottom: 0 },
         cameraRef,
         getWorldBounds,
         viewportRef,
+        /*
+         * 捏合 / Ctrl+滚轮缩放（#409）。Bravais 墙一直没给这个宿主 —— useWallPointerPan 里
+         * `if (!zoomRef.current) return false` 直接把捏合挡在门外，所以「双指彻底没反应」。
+         * 倍率与播放页的磁贴墙共用 useLatticeSettingsStore.wallZoom（BravaisStage 读它，
+         * useBravaisViewport 用它乘到基准档位上）。
+         */
         zoom: {
-            // 基准档位只跟视口宽度走：帧状态里的 scale 已经含了倍率，不能拿它当基准。
-            baseScale: () => {
-                const view = frameRef.current.view;
-                return view ? getBravaisScale(view.width) : 1;
-            },
+            baseScale: () => getBravaisScale(frameRef.current.view?.width ?? window.innerWidth),
             minFactor: WALL_ZOOM_MIN,
             maxFactor: WALL_ZOOM_MAX,
             onZoomEnd: factor => setWallZoom(factor),
+            /*
+             * Bravais 的倍率真源是 view.scale，而 applyCamera 只吃位置 —— 缩放途中不接住就
+             * 完全不缩。但这里**不能**每帧写 store：那会每帧一次 React 重排 + 一次
+             * localStorage 同步写（播放页磁贴墙与 Bravais 共用 wallZoom）。
+             *
+             * 所以途中只改帧状态里的 scale 并重画 DOM，松手那一刻才由 onZoomEnd 写回 store。
+             * 这正是 useBravaisViewport 注释里说的「缩放途中不经过 React」。
+             */
+            onZoomChange: factor => {
+                const view = frameRef.current.view;
+                if (!view) return;
+                const next = getBravaisScale(view.width) * factor;
+                if (!Number.isFinite(next) || Math.abs(next - view.scale) < 1e-4) return;
+                frameRef.current.view = { ...view, scale: next };
+                renderFrame();
+            },
         },
     });
 

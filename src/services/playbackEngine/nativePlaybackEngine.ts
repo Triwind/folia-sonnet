@@ -23,6 +23,27 @@ import { isNativePlaybackReconciling } from './nativePlaybackSync';
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 /**
+ * 一个原生事件从「在播放器线程上生成」到「进到 WebView 的 JS 里」花了多久（毫秒）。
+ *
+ * 这一步是歌词/进度条的全部误差来源：`positionMs` 标的是**生成那一刻**的位置，而
+ * `apply()` 原来把**收到那一刻**当作基准时刻。播放器线程 → 主线程 → `evaluateJavascript`
+ * → JS 上下文这条路上任何一点排队（起播那一瞬间尤其：正在铺歌词、取封面、切视觉器），
+ * 都会变成「时钟从这一秒起整首歌落后那么多」—— 而且因为位置样本不过桥（只有状态边界
+ * 过桥，见 FoliaNativePlayerPlugin），这个落后**没有人来纠正**。
+ *
+ * 两边读的是同一个系统时钟，所以差值就是过桥耗时，不需要另外对齐时钟。
+ *
+ * 异常值一律当 0：墙钟被 NTP 拽回、事件来自另一台机器、或者差出几秒（那不是排队，
+ * 是时钟跳变），都不该把歌词整首推到别处。
+ */
+export const eventDeliveryDelayMs = (wallMs: number | undefined, nowWallMs: number): number => {
+    if (typeof wallMs !== 'number' || !Number.isFinite(wallMs)) return 0;
+    const late = nowWallMs - wallMs;
+    if (!Number.isFinite(late) || late < 0 || late > 3000) return 0;
+    return late;
+};
+
+/**
  * 原生播放（P1）总闸：**已打开**。
  *
  * 曾经因为「开原生播放时 App 内那个歌词可视化页面隔几秒顿一下、关掉就好」停用过一阵。
@@ -40,12 +61,61 @@ const clamp = (value: number, min: number, max: number) => Math.min(Math.max(val
  */
 export const NATIVE_PLAYBACK_ENABLED: boolean = true;
 
+/**
+ * 这条事件是不是旧 source 的迟到事件。
+ *
+ * 两边令牌都已知且不同才可能算旧；任何一边未知（旧版原生没有令牌、尚未认领）一律放行，
+ * 退回 songKey 那一道过滤，不因缺字段丢掉真事件。
+ *
+ * 例外：事件来自原生**自己**换源（`n:` 令牌）时一律放行，交给 songKey 过滤，不论 Web 手上是
+ * `w:`（Web 装的源）还是 `n:`（认领来的源）。单曲循环 / 单曲队列的「下一首」会让原生重装同一个
+ * songKey，原生不一定发 syncTo 让 Web 重新认领，这时按令牌丢事件会让 Web 的播放状态与进度时钟
+ * 整个停住 —— 比放过一条旧事件糟得多。旧 source 的迟到事件带的是 Web 自己发过的 `w:` 令牌
+ * （A→B→A 的 ABA 正是这一种），不受这条例外影响，所以仍然被丢掉。
+ */
+export const isStaleSourceEvent = (eventToken: string | undefined, currentToken: string | null): boolean => {
+    if (!eventToken || !currentToken || eventToken === currentToken) return false;
+    if (eventToken.startsWith('n:')) return false;
+    return true;
+};
+
+/** 每次加载一个前缀：WebView 重载后序号从 1 重来，不会和原生进程里还记着的上一轮令牌撞上。 */
+const SOURCE_TOKEN_SESSION = Math.random().toString(36).slice(2, 8);
+
 class NativePlaybackEngine {
     private positionMs = 0;
     private durationMs = 0;
     private playing = false;
     private hasSource = false;
+    /**
+     * 原生那边此刻**真的**手上有一首歌。
+     *
+     * hasSource 只由 Web 自己的 setSource / adoptSnapshot 置位，认领失败或通知栏先把
+     * 播放拉起来时它是 false，可 ExoPlayer 明明在响 —— 这时 seek / play / pause 会
+     * 全部落到空的 <audio> 元素上，用户看到的就是「歌词跳了曲没跳」「按钮没反应」。
+     * 收到任何一条非 idle 的原生事件就说明那边有媒体，记在这里；idle（stop）清空。
+     */
+    private nativeMediaLive = false;
     private rate = 1;
+    /** Invalidates a pending play result when pause, stop, or a new source takes over. */
+    private playIntentVersion = 0;
+    private sourceGenerationVersion = 0;
+    private sourceReadyPromise: Promise<void> = Promise.resolve();
+    // activeUrl 在 prepare 排队前已更新，不能证明原生真的接住了这一代。
+    private preparedGeneration = -1;
+    private manualSeekVersion = 0;
+    /**
+     * 这次装源已经失败过的证据（prepare 被拒，或原生异步报 error）。
+     *
+     * ExoPlayer 可能在 prepare() 已经 resolve 之后才报错，所以光有 Promise 不够：
+     * 不记下来的话，同一 URL 再来一次 setSource 会被「地址没变」的早退挡掉，
+     * 于是失败只报一次、之后再也重试不了。
+     */
+    private sourceReadyFailure: unknown = null;
+    /** 第几次装源：只有最新那次有权登记 / 清掉失败。 */
+    private sourceReadyGeneration = 0;
+    /** Native bridge commands must stay ordered across source changes and transport actions. */
+    private nativeCommandChain: Promise<void> = Promise.resolve();
     private updatedAtMs = 0;
     /**
      * 上一次对外给过的位置（毫秒）。
@@ -78,13 +148,40 @@ class NativePlaybackEngine {
     private trackGain = 1;
     private currentUrl: string | null = null;
     private songKey: string | null = null;
+    /**
+     * 当前 source 的令牌：每次 `setSource` 生成 `w:<n>`，随 prepare 发给原生，原生随每个事件回传。
+     * songKey 分不开 A→B→A 的同 key 旧事件，令牌可以。null = 未知（旧原生 / 尚未认领），不过滤。
+     */
+    private sourceToken: string | null = null;
+    private sourceTokenSeq = 0;
+    /** 已经应用过的原生事件个数：异步命令的延续靠它判断「这期间有没有更权威的事件到过」。 */
+    private appliedEventSeq = 0;
 
-    /** 认领只重置本地时钟，绝不 prepare / seek / play 原生。 */
-    adoptSnapshot(snapshot: NativePlaybackSnapshot & { url: string; speed?: number }): void {
+    /**
+     * 认领是一个 transport epoch 边界：不向原生发送命令，但必须使认领前的
+     * 播放意图和排队命令失效，避免迟到的 Promise 污染新会话。
+     */
+    adoptSnapshot(snapshot: NativePlaybackSnapshot & { url: string; baseUrl?: string; speed?: number }): boolean {
+        // 对外地址是原始 URL；伴奏/清唱时原生实际加载的是本地 file:// 轨，不能当成换了源。
+        const publicUrl = snapshot.baseUrl || snapshot.url;
+        const active = this.activeUrl();
+        const sameMedia = !!snapshot.sourceToken && snapshot.sourceToken === this.sourceToken
+            && (active === snapshot.url || active === publicUrl) && this.songKey === snapshot.songKey;
         this.ensureSubscription();
-        this.currentUrl = snapshot.url;
+        // 同一个 MediaItem 的认领不洗掉它已经失败的事实：原生那份仍处于 error，下一次 play 必须重新 prepare。
+        const failed = sameMedia ? this.sourceReadyFailure : null;
+        this.playIntentVersion++;
+        this.sourceGenerationVersion++;
+        this.sourceReadyPromise = Promise.resolve();
+        this.preparedGeneration = failed ? -1 : this.sourceGenerationVersion;
+        this.sourceReadyFailure = failed;
+        this.sourceReadyGeneration++;
+        this.currentUrl = sameMedia && active ? active : publicUrl;
         this.songKey = snapshot.songKey ?? null;
+        // 认领原生此刻装着的 source：此后只收这个令牌的事件，认领前排队的旧事件被丢弃（#341）。
+        this.sourceToken = snapshot.sourceToken || null;
         this.hasSource = true;
+        this.nativeMediaLive = true;
         this.positionMs = Math.max(0, snapshot.positionMs);
         this.durationMs = Math.max(0, snapshot.durationMs);
         this.playing = snapshot.playing;
@@ -92,6 +189,7 @@ class NativePlaybackEngine {
         this.stalled = snapshot.buffering ?? false;
         this.updatedAtMs = performance.now();
         this.lastDeliveredMs = this.positionMs;
+        return sameMedia;
     }
     private listeners = new Set<(event: NativePlaybackEvent) => void>();
     private subscriptionStarted = false;
@@ -115,9 +213,9 @@ class NativePlaybackEngine {
         return this.hasSource ? this.currentUrl : null;
     }
 
-    /** 原生手上有没有歌（不论在不在播）。进度条与歌词看这个，不看 isPlaying。 */
+    /** 原生手上有没有歌（不论在不在播）。进度条、歌词与播放控制都看这个，不看 isPlaying。 */
     ownsPlayback(): boolean {
-        return this.hasSource;
+        return this.hasSource || this.nativeMediaLive;
     }
 
     isPlaying(): boolean {
@@ -133,7 +231,15 @@ class NativePlaybackEngine {
      * monotonic 时钟，一首歌的长度里漂移可以忽略。
      */
     getPositionSec(): number {
-        if (!this.hasSource) return 0;
+        /*
+         * 判据用 ownsPlayback() 而不是 hasSource。
+         *
+         * 通知栏 / 锁屏先把播放拉起来、而 Web 侧认领没成功的那几秒里，ExoPlayer 在响，
+         * hasSource 还是 false —— 用 hasSource 判会让这里一律返回 0：拖动进度条时
+         * 歌词时钟被改了、原生也真的跳了，可读回来的位置永远是 0，看起来就是
+         * 「曲没跳」；暂停后再播，进度条也停在 0。原生有媒体，positionMs 就是有效的。
+         */
+        if (!this.ownsPlayback()) return 0;
         const now = performance.now();
         const raw = this.playing && !this.stalled
             ? this.positionMs + Math.max(0, now - this.updatedAtMs) * this.rate
@@ -148,13 +254,47 @@ class NativePlaybackEngine {
         return this.durationMs > 0 ? this.durationMs / 1000 : 0;
     }
 
+    /** The current play intent token; callers can reject stale async play completions. */
+    playIntentGeneration(): number {
+        return this.playIntentVersion;
+    }
+
+    /** The current source token; unlike a URL, it also distinguishes ABA source changes. */
+    sourceGeneration(): number {
+        return this.sourceGenerationVersion;
+    }
+
+    /** The current song identity used to reject same-URL stale completions. */
+    currentSongKey(): string | null {
+        return this.songKey;
+    }
+
+    /** 已经观察到的装源失败；没有失败就是 null。 */
+    sourceReadyError(): unknown {
+        return this.sourceReadyFailure;
+    }
+
+    private enqueueNativeCommand<T>(command: () => Promise<T>, isCurrent: () => boolean = () => true): Promise<T | undefined> {
+        const run = this.nativeCommandChain.then(
+            () => isCurrent() ? command() : undefined,
+            () => isCurrent() ? command() : undefined,
+        );
+        this.nativeCommandChain = run.then(() => undefined, () => undefined);
+        return run;
+    }
+
     async setSource(url: string, options: { startPositionMs?: number | null; repeatMode?: number; songKey?: string | null } = {}): Promise<void> {
         if (isNativePlaybackReconciling()) return;
-        if (this.hasSource && this.currentUrl === url && (!options.songKey || options.songKey === this.songKey)) return;
+        if (this.hasSource && this.currentUrl === url && (!options.songKey || options.songKey === this.songKey) && !this.sourceReadyFailure) return;
+        this.playIntentVersion++;
+        const sourceGeneration = ++this.sourceGenerationVersion;
         this.ensureSubscription();
         this.songKey = options.songKey ?? null;
+        const sourceToken = `w:${SOURCE_TOKEN_SESSION}.${++this.sourceTokenSeq}`;
+        this.sourceToken = sourceToken;
         this.currentUrl = url;
         this.hasSource = true;
+        this.nativeMediaLive = true;
         this.playing = false;
         this.stalled = false;
         this.positionMs = options.startPositionMs ?? 0;
@@ -162,27 +302,114 @@ class NativePlaybackEngine {
         this.updatedAtMs = performance.now();
         this.lastDeliveredMs = this.positionMs;
         if (typeof options.repeatMode === 'number') this.repeatMode = options.repeatMode;
-        await nativePlayer.prepare({
-            url,
-            startPositionMs: options.startPositionMs ?? null,
-            repeatMode: this.repeatMode,
-            songKey: this.songKey,
-        });
-        await nativePlayer.setVolume(this.volume);
+        const songKey = this.songKey;
+        const sourceReady = this.enqueueNativeCommand(async () => {
+            const prepared = await nativePlayer.prepare({
+                url,
+                startPositionMs: options.startPositionMs ?? null,
+                repeatMode: this.repeatMode,
+                songKey,
+                sourceToken,
+            });
+            // 原生已判定这次装源被更新的换源 / stop 取代（没执行）：不再给新 source 推旧音量。
+            if (prepared?.stale || sourceGeneration !== this.sourceGenerationVersion) return;
+            await nativePlayer.setVolume(this.volume);
+            if (sourceGeneration === this.sourceGenerationVersion) this.preparedGeneration = sourceGeneration;
+        }, () => sourceGeneration === this.sourceGenerationVersion);
+        // 装源失败要记下来，否则同一 URL 的重试会被上面的早退挡掉（#368）。
+        const sourceReadyGeneration = ++this.sourceReadyGeneration;
+        this.sourceReadyFailure = null;
+        /*
+         * 缓存这一份只记状态，不再把 rejection 传下去。
+         *
+         * 失败由 await sourceReady 的那一位抛出（setSource 的调用方）；缓存 promise 自己
+         * rejected 的话，没有人在那一刻 await 它时（例如 play() 走的路径）Node 会再算一次
+         * Unhandled Rejection —— 明明已经报过一次了。
+         */
+        this.sourceReadyPromise = sourceReady.then(
+            () => { },
+            (error: unknown) => {
+                if (sourceReadyGeneration === this.sourceReadyGeneration) this.sourceReadyFailure = error;
+            },
+        );
+        await sourceReady;
+        if (sourceGeneration !== this.sourceGenerationVersion) return;
     }
 
-    async play(): Promise<void> {
-        await nativePlayer.play();
+    /**
+     * 返回 true = 这次播放意图真的在原生执行并记成了 playing；false = 被更新的命令 / 换源取代，
+     * 没有生效。调用方不能在 false 时再把界面写成 PLAYING（例如原生那一刻已被通知栏暂停）。
+     */
+    async play(): Promise<boolean> {
+        // 同上：没有订阅就没有状态回执，按钮按下去界面只能靠乐观值猜。
+        this.ensureSubscription();
+        // 上次装源失败过：先按同一个地址重装一次再播，否则压在 rejected 上的 await 会
+        // 直接把这次「点播放」也一起拒掉，用户看到的还是那一条旧报错（#368）。
+        if (this.sourceReadyFailure && this.currentUrl) {
+            /*
+             * 上次装源失败过：先重排一次装源，再播。
+             *
+             * 不递归调用 setSource()：那会把 sourceGeneration / 播放意图号再推一格，
+             * 而 play 里的「意图 +1」判活是按只推一次写的。这里把失败的证据清掉、
+             * 把同一条 prepare 重新排进 nativeCommandChain 就够 —— 命令顺序仍然由链保证。
+             */
+            const retryUrl = this.currentUrl;
+            const retrySongKey = this.songKey;
+            const retryToken = this.sourceToken;
+            this.sourceReadyFailure = null;
+            this.sourceReadyPromise = (async () => {
+                await this.enqueueNativeCommand(
+                    () => nativePlayer.prepare({
+                        url: retryUrl,
+                        startPositionMs: Math.round(this.positionMs),
+                        repeatMode: this.repeatMode,
+                        songKey: retrySongKey,
+                        sourceToken: retryToken,
+                    }),
+                    () => this.currentUrl === retryUrl,
+                );
+            })().catch((error: unknown) => {
+                this.sourceReadyFailure = error;
+            });
+        }
+        const intentGeneration = ++this.playIntentVersion;
+        const sourceGeneration = this.sourceGenerationVersion;
+        await this.sourceReadyPromise;
+        if (intentGeneration !== this.playIntentVersion || sourceGeneration !== this.sourceGenerationVersion) return false;
+        const eventsBefore = this.appliedEventSeq;
+        const played = await this.enqueueNativeCommand(
+            () => nativePlayer.play(),
+            () => intentGeneration === this.playIntentVersion && sourceGeneration === this.sourceGenerationVersion,
+        );
+        if (intentGeneration !== this.playIntentVersion || sourceGeneration !== this.sourceGenerationVersion) return false;
+        // 原生判定这条 play 在执行前已被更新的命令取代：它没有真的播，不能记成 playing。
+        if (played && typeof played === 'object' && played.stale) return false;
+        // Promise 现在在播放器线程执行完才结束，这段时间里本 source 的状态事件（buffering / playing …）
+        // 可能已经先到并写过时钟。事件比这条乐观写入更权威，到过就不再覆盖
+        //（否则缓冲期间 stalled 被改回 false，墙钟照走，歌词跑到声音前面）。
+        if (this.appliedEventSeq !== eventsBefore) return true;
         // 播放意图先记下：等 `playing` 事件回来之前，进度条不该停在原地不动。
         // 从暂停那一帧的位置接着走，而不是从更旧的采样值重新追。
         this.positionMs = this.getPositionSec() * 1000;
         this.playing = true;
         this.stalled = false;
         this.updatedAtMs = performance.now();
+        return true;
     }
 
     async pause(): Promise<void> {
-        await nativePlayer.pause();
+        this.ensureSubscription();
+        this.playIntentVersion++;
+        const sourceGeneration = this.sourceGenerationVersion;
+        const intentGeneration = this.playIntentVersion;
+        const paused = await this.enqueueNativeCommand(
+            () => nativePlayer.pause(),
+            () => sourceGeneration === this.sourceGenerationVersion,
+        );
+        if (sourceGeneration !== this.sourceGenerationVersion) return;
+        // 期间又来了更新的 play / pause：最终状态只由最新意图决定，旧 pause 不回写。
+        if (intentGeneration !== this.playIntentVersion) return;
+        if (paused && typeof paused === 'object' && paused.stale) return;
         // 冻在听众正看着的那一帧，别退回最后一次采样值。
         this.positionMs = this.getPositionSec() * 1000;
         this.playing = false;
@@ -190,25 +417,83 @@ class NativePlaybackEngine {
         this.updatedAtMs = performance.now();
     }
 
+    currentSourceToken(): string | null {
+        return this.sourceToken;
+    }
+
+    manualSeekGeneration(): number {
+        return this.manualSeekVersion;
+    }
+
+    /** 在 prepare 后占住命令顺序；只有同代装源成功、仅因后台未发出的 seek 才能留到前台。 */
+    async seekForResume(seconds: number, stillWanted: () => boolean, deferUntilForeground: () => void): Promise<void> {
+        const targetMs = Math.max(0, Math.round(seconds * 1000));
+        const songKey = this.songKey;
+        const sourceToken = this.sourceToken;
+        const manualSeek = this.manualSeekVersion;
+        const current = () => manualSeek === this.manualSeekVersion && sourceToken === this.sourceToken && this.songKey === songKey
+            && this.sourceGenerationVersion === this.preparedGeneration
+            && !this.sourceReadyFailure && stillWanted();
+        await this.enqueueNativeCommand(async () => {
+            if (!songKey || !sourceToken) return;
+            if (isNativePlaybackReconciling()) {
+                deferUntilForeground();
+                return;
+            }
+            const eventsBefore = this.appliedEventSeq;
+            const result = await nativePlayer.seek(targetMs, { songKey, sourceToken });
+            if (result?.stale || !current() || isNativePlaybackReconciling() || this.appliedEventSeq !== eventsBefore) return;
+            this.positionMs = this.lastDeliveredMs = targetMs;
+            this.updatedAtMs = performance.now();
+        }, current);
+    }
+
     async seek(seconds: number): Promise<void> {
+        this.manualSeekVersion++;
+        /*
+         * 订阅先立起来：seek 之后要靠 `seeked` / `playing` 事件把真实位置带回来。
+         * 通知栏起播、认领未成功时这条订阅可能还没建 —— 不建就永远收不到回执，
+         * 时钟停在这次写下的意图值上，原生跳没跳没人知道。
+         */
+        this.ensureSubscription();
+        // 没有 source 也没有原生在放的东西：没有可跳的对象，别往原生发（它只会回一条空的 seeked）。
+        if (!this.hasSource && !this.nativeMediaLive) return;
         const targetMs = Math.max(0, Math.round(seconds * 1000));
         this.positionMs = targetMs;
         this.updatedAtMs = performance.now();
         // seek 是位置意图，不是缓冲结束：保留 stalled，等待原生实际播放状态（#168）。
         // 跳是唯一允许「往回走」的动作，所以这里必须把只进不退的基准一起复位。
         this.lastDeliveredMs = targetMs;
-        await nativePlayer.seek(targetMs);
+        // 进命令链：seek 不能越过还在装源的 prepare；换源之后旧 seek 不再下发（#337）。
+        // 连发两次 seek 按 FIFO 都执行，最终位置是最后一次的。
+        const sourceGeneration = this.sourceGenerationVersion;
+        await this.enqueueNativeCommand(
+            () => nativePlayer.seek(targetMs),
+            () => sourceGeneration === this.sourceGenerationVersion,
+        );
     }
 
     async stop(): Promise<void> {
+        this.playIntentVersion++;
+        const sourceGeneration = ++this.sourceGenerationVersion;
+        this.sourceReadyPromise = Promise.resolve();
+        // stop 之后没有「待重试的源」：迟到的 prepare 失败不许再登记成可重试状态。
+        this.sourceReadyGeneration++;
+        this.sourceReadyFailure = null;
         this.hasSource = false;
+        this.nativeMediaLive = false;
         this.playing = false;
         this.stalled = false;
         this.positionMs = 0;
         this.durationMs = 0;
         this.lastDeliveredMs = 0;
         this.currentUrl = null;
-        await nativePlayer.stop();
+        this.sourceToken = null;
+        await this.enqueueNativeCommand(
+            () => nativePlayer.stop(),
+            () => sourceGeneration === this.sourceGenerationVersion,
+        );
+        if (sourceGeneration !== this.sourceGenerationVersion) return;
     }
 
     /** 用户音量（0..1）。与 [trackGain] 分开：拖音量不该把响度补偿抹掉。 */
@@ -274,18 +559,39 @@ class NativePlaybackEngine {
         if (this.subscriptionStarted) return;
         this.subscriptionStarted = true;
         void nativePlayer.addListener(event => {
+            /*
+             * 认领期间不改状态机，但「原生手上真的有媒体」这件事必须记下来。
+             *
+             * 通知栏 / 锁屏先把播放拉起来、或认领还没跑完的那几秒里，ExoPlayer 已经在响，
+             * hasSource 却还是 false。不记这一下，用户此时按 seek / play / pause 会全部
+             * 落到空的 <audio> 上 —— 「拖进度条歌词变了曲没跳」「按钮按了没反应」。
+             */
+            this.nativeMediaLive = event.type !== 'idle';
             if (isNativePlaybackReconciling()) return;
             if (event.songKey && this.songKey && event.songKey !== this.songKey) return;
+            if (isStaleSourceEvent(event.sourceToken, this.sourceToken)) return;
             this.apply(event);
             this.listeners.forEach(listener => listener(event));
         }).catch(() => undefined);
     }
 
     private apply(event: NativePlaybackEvent): void {
+        this.appliedEventSeq++;
         const now = performance.now();
+        /*
+         * 事件是**过去**发生的：位置是生成那一刻的位置，基准时刻也要退回到那一刻。
+         *
+         * 不退这一步的后果是整首歌的恒定滞后（见 `eventDeliveryDelayMs`）：歌词、进度条、
+         * 节拍时钟全都比声音晚一段过桥耗时，而且换哪副耳机都一样 —— 因为它跟音频输出无关。
+         */
+        const lateMs = eventDeliveryDelayMs(event.wallMs, Date.now());
+        const stampedAtMs = now - lateMs;
+        if (lateMs >= 60 && (event.type === 'playing' || event.type === 'ready' || event.type === 'seeked' || event.type === 'paused')) {
+            console.info(`[Clock] ${event.type} 事件过桥用了 ${Math.round(lateMs)}ms，基准按生成时刻对齐`);
+        }
         if (typeof event.positionMs === 'number') {
             this.positionMs = Math.max(0, event.positionMs);
-            this.updatedAtMs = now;
+            this.updatedAtMs = stampedAtMs;
         }
         if (typeof event.durationMs === 'number' && event.durationMs > 0) {
             this.durationMs = event.durationMs;
@@ -294,7 +600,7 @@ class NativePlaybackEngine {
             case 'playing':
                 this.playing = true;
                 this.stalled = false;
-                this.updatedAtMs = now;
+                this.updatedAtMs = stampedAtMs;
                 /*
                  * 声音这一刻才真的开始。`play()` 到这一下之间可能隔着缓冲 / 起播，
                  * 日志里是几百毫秒；那段时间墙钟已经走了，不能让歌词白白领先。
@@ -302,10 +608,23 @@ class NativePlaybackEngine {
                  */
                 this.lastDeliveredMs = this.positionMs;
                 break;
+            case 'ready':
+                /*
+                 * 起播前的边界：位置同样是**生成那一刻**的。这一下也允许把时钟往回放 ——
+                 * 缓冲结束时它比前面那几条外推出来的位置更权威，而「只进不退」的夹子会让
+                 * 时钟卡在前面，等墙钟追上来，看起来就是歌词停在原地几百毫秒。
+                 */
+                this.lastDeliveredMs = this.positionMs;
+                break;
             case 'paused':
             case 'ended':
             case 'error':
             case 'idle':
+                // ExoPlayer 可能在 prepare() 已经 resolve 之后才异步报错。记下来，
+                // 同一个 URL 再播才不会再走「地址没变」的早退（#368）。
+                if (event.type === 'error') {
+                    this.sourceReadyFailure = new Error(event.message ?? 'native playback error');
+                }
                 this.playing = false;
                 this.stalled = false;
                 break;
@@ -326,6 +645,13 @@ class NativePlaybackEngine {
                 if (typeof event.playing === 'boolean') this.playing = event.playing;
                 if (typeof event.buffering === 'boolean') this.stalled = event.buffering;
                 this.lastDeliveredMs = this.positionMs;
+                break;
+            case 'position':
+                /*
+                 * 现在的状态边界里已经不带 position（插件侧每 250ms 那一拍只喂壁纸锚点，
+                 * 不过桥）；旧包仍可能推这一拍。位置在上面已统一写入，这里无需额外动作，
+                 * 但要显式列出：switch 的穷尽性检查认的是 enum，default 不算。
+                 */
                 break;
             default:
                 break;

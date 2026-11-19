@@ -1,6 +1,7 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useShallow } from 'zustand/react/shallow';
+import { ChosenSceneName } from '../../../scenes/settings/SceneWindow';
 import { getVisualizerModeLabel } from '../../../visualizer/registry';
 import { usePlayerChromeSettingsStore } from '../../../../stores/usePlayerChromeSettingsStore';
 import { openSettings } from '../../../../stores/useSettingsModalStore';
@@ -12,7 +13,6 @@ import { settingsAnchorSubview } from '../../../../utils/settingsAnchorModel';
 import { isCapacitorAndroid } from '../../../../platform/runtime';
 import { settingsCardClassFor } from '../settingsCardClasses';
 import AndroidForceLandscapeSetting from '../AndroidForceLandscapeSetting';
-import DeviceTypeSetting from '../DeviceTypeSetting';
 import LyricFlatSetting from '../LyricFlatSetting';
 import LyricsWallpaperSettingsSection from '../LyricsWallpaperSettingsSection';
 import { AI, LYRICS_WALLPAPER_OPTIONS, LYRICS, LYRICS_WALLPAPER, O, SONG_THEME, THEME, VIEW } from './appearance/options';
@@ -21,7 +21,8 @@ import { AiConnectionTestReply, useAiConnectionTest } from './AiConnectionTest';
 import { useSettingsPage, type AiApiKeyName } from './settingsPageContext';
 
 // src/components/modal/settings/pages/AppearancePage.tsx
-// The 外观 page: which lyric animation the player uses, light or dark, the colour theme, how a
+// The 外观 page: which lyric animation the player uses, which scene (its window holds each scene's
+// settings and sound tracing), light or dark, the colour theme, how a
 // song's own theme is made and applied, and (desktop app) the AI provider that makes those themes.
 // The lyric animation workbench and the theme colour editor are the existing overlays; their rows
 // here only open them.
@@ -52,7 +53,7 @@ type DaylightChoice = 'light' | 'dark' | 'system';
 
 const AppearancePage: React.FC = () => {
     const { t } = useTranslation();
-    const { isElectron, themeControls, onOpenVisPlayground, onOpenThemePark } = useSettingsPage();
+    const { isElectron, themeControls, onOpenVisPlayground, onOpenThemePark, onOpenSceneWindow } = useSettingsPage();
     const { isDaylight, followSystemTheme, setDaylightPreference, setFollowSystemTheme } = useThemeSettingsStore(useShallow(state => ({
         isDaylight: state.isDaylight,
         followSystemTheme: state.followSystemTheme,
@@ -72,6 +73,9 @@ const AppearancePage: React.FC = () => {
                 <Row option={O.lyricsAnimation} hint={t('options.lyricsRendererDesc')} onClick={onOpenVisPlayground}>
                     <Value>{randomEnabled ? t('ui.visualizerRandom') : getVisualizerModeLabel(visualizerMode, t)}</Value>
                 </Row>
+                <Row option={O.scene} tag={t('ui.sceneBeta')} onClick={onOpenSceneWindow}>
+                    <Value><ChosenSceneName /></Value>
+                </Row>
             </Group>
 
             {/* 歌词动态壁纸单独一张卡：不再和上面「歌词动画样式」挤在同一张里。
@@ -86,8 +90,6 @@ const AppearancePage: React.FC = () => {
                 液态玻璃的开关与参数在「性能与动效」页那一组里（它同时是性能设置）。 */}
             <Group def={VIEW}>
                 <LyricFlatSetting />
-                {/* 下面两项组件内部自行判断运行时：非安卓直接返回 null，这里不用再判端。 */}
-                <DeviceTypeSetting />
                 <AndroidForceLandscapeSetting />
             </Group>
 

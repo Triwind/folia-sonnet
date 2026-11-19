@@ -1,6 +1,6 @@
 import type { SongResult } from '../types';
 import { getPlaybackSongKey } from './appPlaybackGuards';
-import { getSongAlbumLabel, getSongArtistLabel, getSongCoverUrl } from '../services/onlineMusic/songMetadata';
+import { getProviderSongMetadata, getSongAlbumLabel, getSongArtistLabel, getSongCoverUrl } from '../services/onlineMusic/songMetadata';
 
 // src/utils/queueMirrorEntry.ts
 //
@@ -29,6 +29,22 @@ export const resolveLikeIdentity = (song: SongResult | null | undefined): {
 } => {
     const sourceRef = song?.sourceRef?.kind === 'online' ? song.sourceRef : undefined;
     if (!sourceRef) return { providerId: '', serverSongId: '', providerMid: '', providerHash: '', providerAlbumAudioId: '' };
+    /*
+     * 视频站也要在这里认出来。
+     *
+     * 这个函数是「这一条交给原生层去取地址时，用哪个 id」。以前只有音乐平台的分支，
+     * 视频站的歌走到末尾就是全空 —— 原生那边判成「身份不全」，连问都不问，表现就是
+     * 点了没声音、也不报错（日志里只有一行「解析地址失败：队列条目身份不全」）。
+     * 它的 mediaId 就是 bvid，直接当 serverSongId 用。
+     */
+    if (sourceRef.providerId === 'bilibili') {
+        const data = (sourceRef.providerData ?? {}) as Record<string, unknown>;
+        const bvid = String(sourceRef.mediaId ?? '').trim()
+            || (typeof data.bvid === 'string' ? data.bvid.trim() : '');
+        // cid 是多P 投稿的第几集，取流要用它；单P 投稿没有，留空即可。
+        const cid = typeof data.cid === 'number' || typeof data.cid === 'string' ? String(data.cid) : '';
+        return { providerId: 'bilibili', serverSongId: bvid, providerMid: cid, providerHash: '', providerAlbumAudioId: '' };
+    }
     if (sourceRef.providerId === 'netease') {
         return { providerId: 'netease', serverSongId: String(sourceRef.mediaId ?? ''), providerMid: '', providerHash: '', providerAlbumAudioId: '' };
     }
@@ -94,8 +110,33 @@ export type QueueMirrorEntry = {
     providerMid: string;
     providerHash: string;
     providerAlbumAudioId: string;
+    /**
+     * 现成的播放地址。
+     *
+     * 原生那边**先用它**，拿不到才自己去取流（见 FoliaPlaybackService 的 mirrorEntryUrl）。
+     * 视频站的取流要带登录态、要 wbi 签名、还要过本机中转，那套逻辑在 Web 这边已经是
+     * 完备的，原生不认识这一家 —— 所以由这边取好地址放进来。
+     */
+    url?: string;
     liked: boolean;
     canLike: boolean;
+};
+
+/** `blob:` / `data:` 只活在 WebView 进程里，原生下不动。 */
+const isWebViewOnlyUrl = (url: string): boolean => /^(blob:|data:)/i.test(url);
+
+/**
+ * 镜像里的封面地址：必须是原生 `fetchArtwork()` 下得动的。
+ *
+ * 界面用的 `getSongCoverUrl` 会把封面换成字节兜底的 `blob:`（见 onlineCoverFallback），
+ * 原生直接丢弃，后台兜底切歌那首就没有封面（#336）。所以先取界面那份（要登录态的封面
+ * 换成的回环代理地址，原生是下得动的），是 `blob:` / `data:` 就退回 provider 的原始地址，再不行就留空。
+ */
+const nativeMirrorArtworkUrl = (song: SongResult): string => {
+    const ui = (getSongCoverUrl(song) || '').trim();
+    if (ui && !isWebViewOnlyUrl(ui)) return ui;
+    const raw = (getProviderSongMetadata(song).coverUrl || '').trim();
+    return raw && !isWebViewOnlyUrl(raw) ? raw : '';
 };
 
 /** 把一条歌转成镜像条目（与 FoliaPlaybackService 的镜像解析字段一一对应）。 */
@@ -110,7 +151,7 @@ export const buildQueueMirrorEntry = (
         title: song.name || '',
         artist: getSongArtistLabel(song) || '',
         album: getSongAlbumLabel(song) || '',
-        artworkUrl: getSongCoverUrl(song) || '',
+        artworkUrl: nativeMirrorArtworkUrl(song),
         durationMs: getMirrorDurationMs(song),
         providerId: identity.providerId,
         serverSongId: identity.serverSongId,

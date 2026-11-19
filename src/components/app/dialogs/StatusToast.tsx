@@ -4,9 +4,10 @@ import { motion, useIsPresent } from 'framer-motion';
 import { PlatformMark } from '../../login/PlatformMark';
 import { useReducedMotionFor } from '../../../hooks/useReducedMotionFor';
 import { usePlayerOverlayObstacle } from '../../../hooks/usePlayerOverlayLayout';
-import { holdStatusMessage } from '../../../stores/useStatusMessageStore';
+import { holdStatusMessage, setStatusMessage } from '../../../stores/useStatusMessageStore';
 import { Button } from '@/components/ui';
 import type { AppStatusToast } from './buildAppDialogsModel';
+import { LoadingBars } from '../../shared/LoadingBars';
 import './statusToast.css';
 
 // src/components/app/dialogs/StatusToast.tsx
@@ -21,6 +22,8 @@ const OPEN_AFTER_MS = 120;
 const CLOSE_AFTER_MS = 300;
 const EASE_OUT = [0.2, 0.8, 0.2, 1] as const;
 const EASE_IN = [0.4, 0, 1, 1] as const;
+/** 上滑这么多（px）就当作「划走」，把提示浮窗消除。 */
+const SWIPE_AWAY_Y_PX = -48;
 
 export const StatusToast: React.FC<{ toast: AppStatusToast }> = ({ toast }) => {
     const calm = useReducedMotionFor('uiMicroMotion');
@@ -64,17 +67,29 @@ export const StatusToast: React.FC<{ toast: AppStatusToast }> = ({ toast }) => {
             initial={calm ? { opacity: 0 } : { opacity: 0, y: -18 }}
             animate={calm ? { opacity: 1, transition: { duration: 0.15 } } : { opacity: 1, y: 0, transition: { duration: 0.32, ease: EASE_OUT } }}
             exit={calm ? { opacity: 0, transition: { duration: 0.15 } } : { opacity: 0, y: -10, transition: { duration: 0.22, ease: EASE_IN } }}
-            className={`status-toast${isDaylight ? ' is-daylight' : ''}${cancel || action ? ' has-buttons' : ''}${open ? ' is-open' : ''}${calm ? ' is-calm' : ''}${toast.inert ? ' is-inert' : ''}${isPresent ? '' : ' is-leaving'}`}
+            className={`status-toast${toast.activity ? ' has-activity' : ''}${isDaylight ? ' is-daylight' : ''}${cancel || action ? ' has-buttons' : ''}${open ? ' is-open' : ''}${calm ? ' is-calm' : ''}${toast.inert ? ' is-inert' : ''}${isPresent ? '' : ' is-leaving'}`}
+            role={toast.activity ? 'status' : undefined}
+            aria-live={toast.activity ? 'polite' : undefined}
             onPointerEnter={() => rest(true)}
             onPointerLeave={() => rest(false)}
             onFocus={() => rest(true)}
             onBlur={event => {
                 if (!event.currentTarget.contains(event.relatedTarget as Node | null)) rest(false);
             }}
+            /* 触屏上滑把浮窗划走（向上拖）；拖回原位则留在原地。只认竖直方向，避免和横向布局的滚动争手势。 */
+            drag="y"
+            dragSnapToOrigin
+            dragElastic={0.24}
+            dragMomentum={false}
+            onDragEnd={(_, info) => {
+                if (info.offset.y < SWIPE_AWAY_Y_PX) {
+                    setStatusMessage(null);
+                }
+            }}
         >
             <div className="status-toast-line">
                 {/* A message about one online platform leads with that platform's mark; every other message with its type's icon. */}
-                {toast.providerId
+                {toast.activity ? <LoadingBars size={24} status={toast.activity} className={toast.activity === 'error' ? (isDaylight ? 'text-red-500' : 'text-red-400') : toast.activity === 'success' ? (isDaylight ? 'text-green-600' : 'text-green-400') : ''} /> : toast.providerId
                     ? <PlatformMark providerId={toast.providerId} size={20} />
                     : toast.type === 'error'
                         ? <AlertCircle size={18} className={`shrink-0 ${isDaylight ? 'text-red-500' : 'text-red-400'}`} />

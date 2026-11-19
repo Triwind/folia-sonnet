@@ -1,4 +1,4 @@
-import type { SubtitleContentMode, SubtitleOverlayLayout, Theme, VisualizerMode } from '../types';
+import type { LyricRenderQuality, SubtitleContentMode, SubtitleOverlayLayout, Theme, VisualizerMode } from '../types';
 import type { VisualizerTuningBundle } from '../components/visualizer/tuningRegistry';
 import type { VisualizerBackgroundConfig } from '../components/visualizer/backgrounds/definition';
 // OBS 覆盖层不加载 mods（initModVisualizers 需要 Electron 桥接，web 上是 no-op），
@@ -6,9 +6,11 @@ import type { VisualizerBackgroundConfig } from '../components/visualizer/backgr
 import { DEFAULT_VISUALIZER_MODE, isBuiltinVisualizerMode } from '../types/visualizerModes';
 import { decompressConfig } from './appearanceCodec';
 import { parseSubtitleOverlayLayout } from './lyrics/subtitleOverlayLayout';
+import { normalizeLyricRenderQuality } from './lyricRenderQuality';
 import type { ObsAiConfig } from '../services/aiText';
 import { getWebAiProvider } from '../services/runtimeConfig';
 import { resolveObsNowPlayingCard, type ObsNowPlayingCardConfig } from './obsNowPlayingCard';
+import { readCfgParam } from './obsUrl';
 
 // src/utils/obsWebAppearance.ts
 // Parse the OBS URL params (including the appearance cfg shortcode) into the appearance
@@ -55,6 +57,8 @@ export interface ObsWebAppearance {
   subtitleOverlayBackground?: boolean;
   subtitleUpcomingLyricsBlur?: boolean;
   subtitleOverlayOpacity?: number;
+  /** 歌词画布的分辨率与抗锯齿；配置码里没有时是 undefined，OBS 页面用默认。 */
+  lyricRenderQuality?: LyricRenderQuality;
   showHarmonySubtitle?: boolean;
   harmonySubtitleBackground?: boolean;
   // Font stack (raw store fields; overlaid onto the theme in ObsWebSourceApp so fonts match the
@@ -72,13 +76,15 @@ export interface ObsWebAppearance {
   nowPlayingCard: ObsNowPlayingCardConfig | null;
 }
 
-export function parseObsWebParams(search: string): ObsWebParams {
+// search is location.search, hash is location.hash: cfg is read from the fragment first (see
+// readCfgParam), every other field from the query string only.
+export function parseObsWebParams(search: string, hash = ''): ObsWebParams {
   const params = new URLSearchParams(search);
   return {
     // Sanitize host to host:port characters only; an untrusted '#'/space would otherwise
     // produce a malformed ws:// URL that throws in the WebSocket constructor.
     host: (params.get('host')?.trim() || '').replace(/[^\w.\-:[\]]/g, ''),
-    cfg: params.get('cfg'),
+    cfg: readCfgParam(search, hash),
     // OBS overlay defaults to the dark theme; only daylight=1 picks the light side.
     isDaylight: params.get('daylight') === '1',
     // Absent and transparent=0 both show the opaque theme background — matching the
@@ -106,6 +112,12 @@ interface BuildAppearanceOptions {
   visualizerOverride?: string;
   themeMode?: ObsThemeMode | null;
 }
+
+/** 配置码里的歌词画布分辨率与抗锯齿，读成合法值；没有这一项是 undefined（OBS 页面用默认）。 */
+const readLyricRenderQuality = (decoded: unknown): LyricRenderQuality | undefined => {
+  const raw = decoded && typeof decoded === 'object' ? (decoded as { lyricRenderQuality?: unknown }).lyricRenderQuality : undefined;
+  return raw ? normalizeLyricRenderQuality(raw) : undefined;
+};
 
 export function buildObsAppearanceFromShortcode(
   cfg: string | null,
@@ -177,6 +189,8 @@ export function buildObsAppearanceFromShortcode(
     subtitleOverlayBackground: decoded?.subtitleOverlayBackground,
     subtitleUpcomingLyricsBlur: decoded?.subtitleUpcomingLyricsBlur,
     subtitleOverlayOpacity: decoded?.subtitleOverlayOpacity,
+    // 配置码可能是手改的 JSON：读成合法值再交出去（渲染器直接用它算像素密度）
+    lyricRenderQuality: readLyricRenderQuality(decoded),
     showHarmonySubtitle: decoded?.showHarmonySubtitle,
     harmonySubtitleBackground: decoded?.harmonySubtitleBackground,
     lyricsFontStyle: decoded?.lyricsFontStyle,

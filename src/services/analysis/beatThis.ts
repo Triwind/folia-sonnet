@@ -1,4 +1,4 @@
-import { hasWebGpu, runBeatThisGpu, type PercussiveEnergyFrames } from './beatThisGpu';
+import { runBeatThisGpu, type PercussiveEnergyFrames } from './beatThisGpu';
 import type { Urgency } from './scheduler';
 
 import { modelCanRun, noteModelFailed } from './modelAvailability';
@@ -462,12 +462,7 @@ export const gridFromBeats = (
  */
 export const canRunBeatThis = (): boolean => {
     if (typeof window === 'undefined') return false;
-    if (!modelCanRun('beat_this')) return false;
-    // Weights that are there still need something to run them on: the desktop app's CPU worker, or
-    // this renderer's own WebGPU (analyseBeatGrid tries the GPU first and falls back to the CPU).
-    // Requiring the bridge - the old answer - is what kept a downloaded copy from counting anywhere
-    // without a main process, i.e. everywhere but the desktop app.
-    return typeof window.electron?.runBeatThis === 'function' || hasWebGpu();
+    return typeof window.electron?.runBeatThis === 'function' && modelCanRun('beat_this');
 };
 
 /**

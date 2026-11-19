@@ -10,13 +10,17 @@ import {
 } from '../services/playbackAdapters';
 import { omni } from '../services/onlineMusic/omni';
 import { noteProviderAuthExpired } from '../services/onlineMusic/authExpiry';
+import { sanitizeSearchHistory, withSearchHistoryQuery, withoutSearchHistoryQuery } from '../utils/searchHistory';
+import { getStoredString, setStoredString } from './storagePrimitives';
 import { isLocalPlaybackSong, isNavidromePlaybackSong } from '../utils/appPlaybackGuards';
 import { listAiCloudCacheSongs } from '../services/aiCloudCache';
 import { resolveCloudThemeSong } from '../library/core/collection/resource/cloudThemeCollectionDeps.service';
 
 const LAST_HOME_VIEW_TAB_KEY = 'last_home_view_tab';
+/** 搜索历史：字符串数组的 JSON，最近的在前。列表的规则（去重、淘汰）在 utils/searchHistory.ts。 */
+const SEARCH_HISTORY_KEY = 'folia_search_history_v1';
 const DEFAULT_SEARCH_LIMIT = 30;
-export type SearchSource = OnlineProviderId | 'local' | 'navidrome' | 'cloud' | 'all';
+export type SearchSource = OnlineProviderId | 'local' | 'navidrome' | 'cloud' | 'bilibili' | 'all';
 export type SearchReturnView = 'home' | 'player';
 /** 搜什么：单曲、专辑或歌单。专辑和歌单只有在线平台搜得到（omni.getProviderSearchKinds），本地与 Navidrome 只搜单曲。 */
 export type SearchKind = OmniSearchKind;
@@ -85,6 +89,13 @@ interface SearchNavigationState {
      */
     isResultsBarHidden: boolean;
     searchCache: Record<string, SearchCacheEntry>;
+    /**
+     * 搜过的词，最近的在前（跨会话保留）。只由 submitSearch 记：所有搜索入口都经过它，
+     * 所以这里不提供「记一条」的动作，界面只能读、删一条或清空。
+     */
+    searchHistory: string[];
+    forgetSearchHistoryQuery: (query: string) => void;
+    clearSearchHistory: () => void;
     setHomeViewTab: (tab: HomeViewTab) => void;
     setSearchQuery: (query: string) => void;
     setSearchScrollTop: (scrollTop: number) => void;
@@ -106,7 +117,13 @@ const getSearchCacheKey = (query: string, sourceTab: SearchSource, kind: SearchK
     `${sourceTab}:${kind}:${query.trim().toLowerCase()}`
 );
 
-/** 这个来源能搜的种类：在线平台问 omni，本地 / Navidrome / 云缓存 /「全部」只有单曲。单曲总在第一个。 */
+/**
+ * 这个来源能搜的种类：在线平台问 omni，本地 / Navidrome / 云缓存 /「全部」只有单曲。
+ *
+ * 以前无论平台声明了什么都会把单曲补到最前面。视频站不能这么补：它搜出来的每条本来就
+ * 是一条投稿，「单曲」和「视频」是同一份结果，补上去就多一个点开全是重复内容的页签。
+ * 现在只在这个平台**什么种类都没声明**时才退回单曲。
+ */
 export const getSearchKinds = (sourceTab: SearchSource): SearchKind[] => {
     // 这几种不是某一个平台：云缓存是按歌名去各家搜，「全部」是把各家掺起来 ——
     // 它们都没有「这家平台能搜什么」可问，问了会拿到 unsupported 而把整次搜索打断。
@@ -114,19 +131,20 @@ export const getSearchKinds = (sourceTab: SearchSource): SearchKind[] => {
         return ['song'];
     }
     const kinds = omni.getProviderSearchKinds(sourceTab);
-    return kinds.includes('song') ? kinds : ['song', ...kinds];
+    return kinds.length > 0 ? kinds : (['song'] as SearchKind[]);
 };
 
-/** 来源搜不到要的那一种（换到了没有专辑搜索的平台）就搜单曲。 */
-export const resolveSearchKind = (sourceTab: SearchSource, kind: SearchKind): SearchKind => (
-    getSearchKinds(sourceTab).includes(kind) ? kind : 'song'
-);
+/** 来源搜不到要的那一种（换到了没有专辑搜索的平台）就退到这个来源的第一种。 */
+export const resolveSearchKind = (sourceTab: SearchSource, kind: SearchKind): SearchKind => {
+    const kinds = getSearchKinds(sourceTab);
+    return kinds.includes(kind) ? kind : (kinds[0] ?? 'song');
+};
 
 export const resolveSearchSource = (tab: HomeViewTab | SearchSource): SearchSource => {
-    if (tab === 'local' || tab === 'navidrome' || tab === 'cloud' || tab === 'all') {
+    if (tab === 'local' || tab === 'navidrome' || tab === 'cloud' || tab === 'bilibili' || tab === 'all') {
         return tab;
     }
-    if (tab !== 'playlist' && tab !== 'albums' && tab !== 'radio' && tab !== 'explore') return tab as OnlineProviderId;
+    if (tab !== 'playlist' && tab !== 'albums' && tab !== 'radio' && tab !== 'explore') return tab;
     return DEFAULT_ONLINE_PROVIDER_ID;
 };
 
@@ -156,11 +174,11 @@ const mapLocalSongToUnifiedSong = (
     song: LocalSong,
     catalog?: LocalLibraryDisplayCatalog,
 ): UnifiedSong => applyLocalLibraryEntityDisplay(buildUnifiedLocalSong({
-        localSong: song,
-        matchedSong: null,
-        coverUrl: song.useOnlineCover ? song.onlineMetadata?.coverUrl || null : null,
-        preferOnlineMetadata: false,
-    }), catalog);
+    localSong: song,
+    matchedSong: null,
+    coverUrl: song.useOnlineCover ? song.onlineMetadata?.coverUrl || null : null,
+    preferOnlineMetadata: false,
+}), catalog);
 
 const searchLocalSongs = (
     deps: SearchExecutorDeps,
@@ -278,7 +296,7 @@ const mapWithConcurrency = async <T, R>(
             const index = cursor;
             cursor += 1;
             if (index >= items.length) return;
-            results[index] = await worker(items[index] as T);
+            results[index] = await worker(items[index]);
         }
     });
     await Promise.all(lanes);
@@ -414,19 +432,45 @@ const executeSearch = async (
         return searchAllSources(query, offset, limit, deps, onPartial);
     }
 
-    return kind === 'song'
+    /*
+     * 「视频」那一档走单曲的路。
+     *
+     * 视频站搜出来的每条本来就是一条投稿 —— 「视频」和「单曲」是同一份结果（见
+     * omni.getProviderSearchKinds 的注释）。以前这里只判 `kind === 'song'`，
+     * 「视频」落进了集合路径，集合路径里又没有 video 的实现（落到歌单那档的守卫，
+     * 回一个空页）—— 用户看到的就是「视频搜不出来」。现在视频也交给单曲路径，
+     * 结果照常摆进 `searchResults`。
+     */
+    return kind === 'song' || kind === 'video'
         ? searchOnlineProviderSongs(sourceTab, query, limit, offset)
         : searchOnlineProviderCollections(sourceTab, kind, query, limit, offset);
 };
 
 const getInitialHomeViewTab = (): HomeViewTab => {
-    if (typeof window === 'undefined') {
-        return 'playlist';
-    }
-    const savedTab = localStorage.getItem(LAST_HOME_VIEW_TAB_KEY);
+    // 走 storagePrimitives：存储被裁掉的 WebView（以及只 stub 了 window 的单测）里，
+    // 裸 localStorage 会抛 ReferenceError，连 store 的初始化都跟着挂掉。
+    const savedTab = getStoredString(LAST_HOME_VIEW_TAB_KEY, '');
     return savedTab === 'playlist' || savedTab === 'local' || savedTab === 'albums' || savedTab === 'navidrome' || savedTab === 'radio' || savedTab === 'explore'
         ? savedTab
         : 'playlist';
+};
+
+const readSearchHistory = (): string[] => {
+    try {
+        const raw = getStoredString(SEARCH_HISTORY_KEY, '');
+        return raw ? sanitizeSearchHistory(JSON.parse(raw)) : [];
+    } catch (error) {
+        console.warn('[SearchStore] Failed to restore search history:', error);
+        return [];
+    }
+};
+
+const writeSearchHistory = (history: string[]) => {
+    try {
+        setStoredString(SEARCH_HISTORY_KEY, JSON.stringify(history));
+    } catch (error) {
+        console.warn('[SearchStore] Failed to save search history:', error);
+    }
 };
 
 export const useSearchNavigationStore = create<SearchNavigationState>((set, get) => ({
@@ -451,11 +495,23 @@ export const useSearchNavigationStore = create<SearchNavigationState>((set, get)
     searchAuthExpiredProvider: null,
     isResultsBarHidden: false,
     searchCache: {},
+    searchHistory: readSearchHistory(),
+    forgetSearchHistoryQuery: (query) => {
+        const current = get().searchHistory;
+        const next = withoutSearchHistoryQuery(current, query);
+        if (next.length === current.length) return;
+        writeSearchHistory(next);
+        set({ searchHistory: next });
+    },
+    clearSearchHistory: () => {
+        if (get().searchHistory.length === 0) return;
+        writeSearchHistory([]);
+        set({ searchHistory: [] });
+    },
     setHomeViewTab: (tab) => {
-        if (typeof window !== 'undefined') {
-            localStorage.setItem(LAST_HOME_VIEW_TAB_KEY, tab);
-        }
+        // 先切换再记：写法若抛（存储被裁），页签照样跟着点走，只是不记忆。
         set({ homeViewTab: tab });
+        setStoredString(LAST_HOME_VIEW_TAB_KEY, tab);
     },
     setSearchQuery: (query) => set({ searchQuery: query }),
     // 相等就原样返回：列表的 onScroll 会反复调用，卸载时也会补一次复位，不能每次都让订阅者重渲染。
@@ -532,9 +588,13 @@ export const useSearchNavigationStore = create<SearchNavigationState>((set, get)
 
         const searchKind = resolveSearchKind(sourceTab, kind ?? get().searchKind);
         const requestId = get().requestId + 1;
+        // 提交的那一刻就记进历史：首页、命令面板、搜索页都从这里过，结果回来之前历史已经是新的。
+        const searchHistory = withSearchHistoryQuery(get().searchHistory, trimmedQuery);
+        writeSearchHistory(searchHistory);
         set({
             searchQuery: trimmedQuery,
             submittedQuery: trimmedQuery,
+            searchHistory,
             searchSourceTab: sourceTab,
             searchKind,
             searchReturnView: returnView,

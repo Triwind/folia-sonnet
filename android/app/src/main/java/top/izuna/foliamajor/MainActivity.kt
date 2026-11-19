@@ -262,6 +262,9 @@ class MainActivity : BridgeActivity() {
         registerPlugin(top.izuna.foliamajor.automix.FoliaAutomixModelsPlugin::class.java)
         // 汽水音乐：签名宿主（隐藏 WebView + bdms.js）的原生桥。
         registerPlugin(FoliaQishuiPlugin::class.java)
+        // bilibili：MV 背景要搜索和取播放地址，而 api.bilibili.com 不给 CORS 头，
+        // WebView 直连必然被拦。这个桥用 OkHttp 代发只读 GET（不需要登录态）。
+        registerPlugin(FoliaBilibiliPlugin::class.java)
         // 「莱茵生命」三维专辑架现在走内嵌网页（RhineLabUI），原生渲染桥已移除。
         // YouTube Music：只管「登录一次、把 YouTube 的 cookie 交出来」，取数不经过原生
         // （youtubei.js 跑在主 WebView 里，见 FoliaYtmPlugin 的说明）。
@@ -275,6 +278,18 @@ class MainActivity : BridgeActivity() {
         // 原生过渡系统：规划 / 分析 / 执行全部在原生侧，WebView 只保留设置 UI 与 cue 动画。
         // 注册本身不碰任何播放行为（与 FoliaNativePlayerPlugin 同一条纪律）。
         registerPlugin(top.izuna.foliamajor.player.transition.bridge.FoliaTransitionPlugin::class.java)
+        // 安卓端的模组系统：渲染端问 window.electron.mods，这个插件把请求转给进程内的
+        // Node 运行时（FoliaNodeRuntime，nodejs-mobile），模组的 main 入口在那里跑。
+        registerPlugin(top.izuna.foliamajor.mods.FoliaModsPlugin::class.java)
+
+        // 模组的 client 入口要从私有目录同源加载：桌面端用 folia-mod:// 协议，安卓靠这里
+        // 把 /mods/<id>/<digest>/<client> 改写成真实文件路径。同样必须在 super 之前
+        // （bridgeBuilder.create() 在 BridgeActivity.onCreate 里）。
+        bridgeBuilder.setRouteProcessor(
+            top.izuna.foliamajor.mods.ModRouteProcessor(
+                java.io.File(top.izuna.foliamajor.mods.FoliaNodeRuntime.getUserDataDir(this), "mods")
+            )
+        )
 
         super.onCreate(savedInstanceState)
 
@@ -474,6 +489,16 @@ class MainActivity : BridgeActivity() {
         // 回前台：把渲染放回来。
         FoliaPlaybackService.appUiVisible = true
         FoliaNativePlugin.emitAppBackground(false)
+        /*
+         * 回前台补一次封面（#309 的兜底）。
+         *
+         * 正常情况下服务自己会退避重试（见 fetchArtwork 里的 ARTWORK_MAX_RETRIES）：
+         * App 在后台时 Web 被冻结，不会有「Web 再推一次」的机会，所以重试必须在原生侧。
+         * 但 Doze 里网络可能整段不可用、四次都失败；用户回前台时网络通常已经好了，
+         * 这时补一次几乎立刻就能把封面补上 —— 这也正是用户看到的「切前台立刻恢复」。
+         * 有了它，那个「立刻恢复」不再是碰巧，而是真的去补。
+         */
+        FoliaPlaybackService.activeService()?.retryMissingArtwork()
     }
 
     override fun onStop() {

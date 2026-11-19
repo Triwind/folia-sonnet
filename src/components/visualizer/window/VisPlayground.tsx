@@ -120,7 +120,7 @@ const clampFontScale = (value: number) => Math.min(1.4, Math.max(0.85, value));
 
 
 /** How many pictures of lyric styles lie side by side under the sample: in the wide window, and where it is one column. */
-const SHELF_COLUMNS = { wide: 7, narrow: 4 };
+export const SHELF_COLUMNS = { wide: 7, narrow: 4 };
 
 const VisPlayground: React.FC<VisPlaygroundProps> = ({
     theme,
@@ -288,7 +288,8 @@ const VisPlayground: React.FC<VisPlaygroundProps> = ({
     const foliumVisualizerEntries = useFoliumRegistryEntries(visualizersRegistry);
     const modeOptions = useMemo(() => (
         [
-            ...VISUALIZER_REGISTRY.map(entry => ({
+            // 藏起来的款式不进选择器（它们另有家门：见 definition.ts 的 hiddenFromPickers）。
+            ...VISUALIZER_REGISTRY.filter(entry => !entry.hiddenFromPickers).map(entry => ({
                 label: getVisualizerModeLabel(entry.mode, t),
                 value: entry.mode,
             })),

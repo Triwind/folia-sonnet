@@ -9,6 +9,11 @@
 // (its `storage`), its field and its actions are built from that declaration by `tuningFields`,
 // and its part of the type comes from VisualizerTuningSettings, which each tuning.ts adds to. A
 // background's settings that are no tuning object come whole from its settings.ts.
+//
+// @note 帧率上限（visualizer_frame_rate）和辉光模糊量化（visualizer_glow_blur_quantize）是用户明确决定「不进外观配置导入导出」的
+// 设置（2026-11-08）：配置码也用于 web 版 OBS 链接，只加 OBS 页面看得到的；OBS 的浏览器源按 OBS 自己设的帧率渲染，辉光量化
+// 开关看起来几乎一样。同一批里的歌词画布分辨率与抗锯齿（lyricRenderQuality）进了配置码。不要按 settings-feature-integration
+// 「视觉设置必须进 buildCurrentConfig / compressConfig / decompressConfig / validKeys / handleImportConfig」的规则把这两个补进去。
 
 import { create } from 'zustand';
 import { getVisualizerModeLabel } from '../components/visualizer/registry';
@@ -24,7 +29,7 @@ import { setStatusMessage } from './useStatusMessageStore';
 import { SMART_BEAT_STORAGE_KEY, type SmartBeatPatch, VISUALIZER_OPACITY_STORAGE_KEY, readStoredBackgroundOpacity, readStoredLyricRenderQuality, readStoredSmartBeatSettings, resolveSmartBeatSettings, readStoredTuning, readStoredVisualizerBackgroundMode, readStoredVisualizerFrameRate, readStoredVisualizerMode, readStoredVisualizerOpacity, toStoredSmartBeat, writeStoredTuning, WALLPAPER_OVERLAY_OPACITY_STORAGE_KEY, readStoredWallpaperOverlayOpacity, WALLPAPER_FLOATING_OPACITY_STORAGE_KEY, readStoredWallpaperFloatingOpacity, WALLPAPER_FLOATING_OVER_SAFE_AREA_STORAGE_KEY, readStoredWallpaperFloatingOverSafeArea, WALLPAPER_FLOATING_OFFSET_X_STORAGE_KEY, readStoredWallpaperFloatingOffsetX, WALLPAPER_FLOATING_WIDTH_STORAGE_KEY, readStoredWallpaperFloatingWidth, WALLPAPER_LYRICS_FONT_MODE_STORAGE_KEY, readStoredWallpaperLyricsFontMode, WALLPAPER_FLOATING_FILL_SAFE_AREA_STORAGE_KEY, readStoredWallpaperFloatingFillSafeArea, WALLPAPER_FLOATING_AVOID_WIDTH_STORAGE_KEY, readStoredWallpaperFloatingAvoidWidth, WALLPAPER_FLOATING_AVOID_OFFSET_X_STORAGE_KEY, readStoredWallpaperFloatingAvoidOffsetX, WALLPAPER_FLOATING_FONT_SIZE_MODE_STORAGE_KEY, readStoredWallpaperFloatingFontSizeMode, WALLPAPER_FLOATING_FONT_SIZE_STORAGE_KEY, readStoredWallpaperFloatingFontSize, WALLPAPER_OVERLAY_ENABLED_STORAGE_KEY, readStoredWallpaperOverlayEnabled, WALLPAPER_OVERLAY_LOCK_SCREEN_STORAGE_KEY, readStoredWallpaperOverlayLockScreen, WALLPAPER_OVERLAY_LOCK_SCREEN_ONLY_STORAGE_KEY, readStoredWallpaperOverlayLockScreenOnly, WALLPAPER_OVERLAY_ALL_APPS_STORAGE_KEY, readStoredWallpaperOverlayAllApps, WALLPAPER_OVERLAY_HIDE_NATIVE_LYRICS_STORAGE_KEY, readStoredWallpaperOverlayHideNativeLyrics, WALLPAPER_OVERLAY_HIDE_COVER_ART_STORAGE_KEY, readStoredWallpaperOverlayHideCoverArt, WALLPAPER_OVERLAY_HIDE_AFTER_LYRICS_END_STORAGE_KEY, readStoredWallpaperOverlayHideAfterLyricsEnd, WALLPAPER_OVERLAY_SKIP_INSTRUMENTAL_STORAGE_KEY, WALLPAPER_OVERLAY_HIDE_WHEN_PAUSED_STORAGE_KEY, readStoredWallpaperOverlayHideWhenPaused, readStoredWallpaperOverlaySkipInstrumental, WALLPAPER_OVERLAY_HIDE_NATIVE_PROGRESS_STORAGE_KEY, readStoredWallpaperOverlayHideNativeProgress, WALLPAPER_VIDEO_ROTATION_STORAGE_KEY, readStoredWallpaperVideoRotation } from './visualizerSettingsPersistence';
 import { getStoredBoolean, getStoredString, setStoredBoolean, setStoredString } from './storagePrimitives';
 import { RANDOM_VISUALIZER_MODES_STORAGE_KEY, readStoredRandomVisualizerModes } from './visualizerSettingsPersistence';
-import { normalizeRandomVisualizerModes, type RandomVisualizerMode } from '../utils/randomVisualizerModes';
+import { normalizeRandomVisualizerModes, normalizeRandomVisualizerModesWith } from '../utils/randomVisualizerModes';
 
 export type SetVisualizerModeOptions = { notify?: boolean; preserveRandom?: boolean };
 
@@ -38,8 +43,8 @@ export const LYRICS_WALLPAPER_TRANSLATION_STORAGE_KEY = 'folia.lyricsWallpaperTr
 export const LYRICS_WALLPAPER_STYLE_STORAGE_KEY = 'folia.lyricsWallpaperStyle';
 const DEFAULT_WALLPAPER_BLUR = 0.35;
 
-const resolveWallpaperBackground = (value: string): 'cover' | 'color' | 'image' | 'video' =>
-    value === 'color' || value === 'image' || value === 'video' ? value : 'cover';
+const resolveWallpaperBackground = (value: string): 'cover' | 'color' | 'image' | 'video' | 'mv' =>
+    value === 'color' || value === 'image' || value === 'video' || value === 'mv' ? value : 'cover';
 
 const clampWallpaperBlur = (value: number): number => {
     if (!Number.isFinite(value)) return DEFAULT_WALLPAPER_BLUR;
@@ -63,7 +68,11 @@ type OwnSettingsState = {
     renderPixelRatio: RenderPixelRatio | null;
     visualizerMode: VisualizerMode;
     randomVisualizerModePerSong: boolean;
-    randomVisualizerModes: RandomVisualizerMode[];
+    /**
+     * 随机池。**可以含 mod 样式**（mod:<modId>:<id>），所以这里是 VisualizerMode
+     * 而不是 RandomVisualizerMode —— 后者只是内置那几个的字面量联合（#414）。
+     */
+    randomVisualizerModes: VisualizerMode[];
     /** Snap animated glow blur radii to a bounded set. See components/visualizer/wordGlow.ts. */
     glowBlurQuantize: boolean;
     /**
@@ -86,13 +95,20 @@ type OwnSettingsState = {
     handleSetRenderPixelRatio: (limit: RenderPixelRatio | null) => void;
     handleSetVisualizerMode: (mode: VisualizerMode, options?: SetVisualizerModeOptions) => void;
     handleToggleRandomVisualizerModePerSong: (enable: boolean, options?: { notify?: boolean }) => void;
-    handleSetRandomVisualizerModes: (modes: readonly VisualizerMode[]) => void;
+    /**
+     * 设定随机池。isKnown 给了就按它判断哪些 id 有效（选择器会传入注册表查询，
+     * 让 mod 样式也能进池）；不给则只认内置白名单（存储恢复 / 配置导入这类拿不到注册表的地方）。
+     */
+    handleSetRandomVisualizerModes: (modes: readonly VisualizerMode[], isKnown?: (mode: string) => boolean) => void;
     handleToggleGlowBlurQuantize: (enable: boolean) => void;
     handleSetKeywordColoringEnabled: (enable: boolean) => void;
     handleSetSmartBeat: (patch: SmartBeatPatch) => void;
     lyricsWallpaperFeed: boolean;
-    /** 歌词壁纸的背景：'cover' 模糊封面，'color' 主题色渐变，'image' 自选图片，'video' 自选视频。 */
-    lyricsWallpaperBackground: 'cover' | 'color' | 'image' | 'video';
+    /**
+     * 歌词壁纸的背景：'cover' 模糊封面，'color' 主题色渐变，'image' 自选图片，
+     * 'video' 自选视频，'mv' B 站 MV（按歌自动匹配一条投稿当背景）。
+     */
+    lyricsWallpaperBackground: 'cover' | 'color' | 'image' | 'video' | 'mv';
     /** 自选背景图的 base64，lyricsWallpaperBackground='image' 时生效。 */
     lyricsWallpaperImage: string | null;
     /**
@@ -206,7 +222,7 @@ type OwnSettingsState = {
      */
     wallpaperOverlayHideCoverArt: boolean;
     handleToggleLyricsWallpaperFeed: (enable: boolean) => void;
-    handleSetLyricsWallpaperBackground: (mode: 'cover' | 'color' | 'image' | 'video') => void;
+    handleSetLyricsWallpaperBackground: (mode: 'cover' | 'color' | 'image' | 'video' | 'mv') => void;
     handleSetLyricsWallpaperImage: (image: string | null) => void;
     /** 设定桌面壁纸视频的旋转角度（0/90/180/270），会持久化。 */
     handleSetWallpaperVideoRotation: (degrees: number) => void;
@@ -451,8 +467,18 @@ export const useVisualizerSettingsStore = create<VisualizerSettingsState>((set, 
             });
         }
     },
-    handleSetRandomVisualizerModes: (modes) => {
-        const next = normalizeRandomVisualizerModes(modes);
+    handleSetRandomVisualizerModes: (modes, isKnown) => {
+        /*
+         * 认不认 mod 样式由调用方说了算（#414）。
+         *
+         * 这里以前固定走 normalizeRandomVisualizerModes —— 那个版本**只认内置白名单**
+         * （它给 store 初始化、同步 schema 这类拿不到注册表的地方用）。于是选择器里勾一个
+         * mod 样式，传进来的池子被过滤回内置，「点了没反应」。
+         * 选择器手上有注册表，会把 isKnown 递进来；没递（存储恢复、配置导入）就仍按内置归一化。
+         */
+        const next = isKnown
+            ? normalizeRandomVisualizerModesWith(modes, isKnown)
+            : normalizeRandomVisualizerModes(modes);
         setStoredString(RANDOM_VISUALIZER_MODES_STORAGE_KEY, JSON.stringify(next));
         set({ randomVisualizerModes: next });
     },

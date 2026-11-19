@@ -11,7 +11,9 @@ const h = vi.hoisted(() => ({
 }));
 vi.mock('@/services/playbackEngine/nativePlaybackEngine', () => ({ nativePlaybackEngine: { adoptSnapshot: h.adoptSnapshot } }));
 vi.mock('@/stores/motionSignals', () => ({ currentTime: { set: h.setTime } }));
-vi.mock('@/components/app/playback/currentSong', () => ({ dropPlaysInFlight: h.drop, makeSongCurrent: h.makeCurrent }));
+vi.mock(import('@/components/app/playback/currentSong'), async original => ({
+    ...await original(), dropPlaysInFlight: h.drop, makeSongCurrent: h.makeCurrent,
+}));
 const { usePlaybackStore } = await import('@/stores/usePlaybackStore');
 const { adoptNativePlaybackState } = await import('@/components/app/playback/restore/adoptNativePlaybackState');
 const song = (id: string): SongResult => ({ id, name: id, artists: [], album: { id: 0, name: '' }, durationMs: 90000, sourceRef: { kind: 'online', providerId: 'netease', mediaId: id } } as SongResult);
@@ -36,6 +38,15 @@ describe('native wake snapshot', () => {
         expect(h.drop).not.toHaveBeenCalled();
         expect(usePlaybackStore.getState().audioSrc).toBe(native.nativeMedia!.url);
         expect(usePlaybackStore.getState().lyrics).toBe(null);
+    });
+    // #323：换歌那一下 store 会清掉上一首的封面，原生给的封面要在换歌之后写，才不会被一起清掉。
+    it('keeps the native artwork once the claimed song has replaced the previous one', () => {
+        h.makeCurrent.mockImplementation((next: SongResult) => usePlaybackStore.getState().setCurrentSong(next));
+        usePlaybackStore.setState({ cachedCoverUrl: 'blob:cover-of-A' });
+        const native = { ...snapshot(), artworkUrl: 'https://cover.invalid/B.jpg' };
+        expect(adoptNativePlaybackState(native)).toBe(true);
+        expect(usePlaybackStore.getState().cachedCoverUrl).toBe('https://cover.invalid/B.jpg');
+        h.makeCurrent.mockReset();
     });
     it('preserves pause and a zero position, not truthy-only position or forced PLAYING', () => {
         adoptNativePlaybackState(snapshot(false, 0));

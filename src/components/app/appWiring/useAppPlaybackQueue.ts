@@ -8,7 +8,7 @@ import { isWallLibrarySuite, useActiveLibrarySuiteId } from '../../../library/ap
 import { registerLocalTrackFileReader } from '../../../services/analysis/trackAudio';
 import { useAutomixDecks } from '../../../services/automix/useAutomixDecks';
 import { getLocalSongArrayBuffer } from '../../../services/localMusicService';
-import { getSongArtistLabel, getSongCoverUrl } from '../../../services/onlineMusic/songMetadata';
+import { getSongAlbumLabel, getSongArtistLabel, getSongCoverUrl } from '../../../services/onlineMusic/songMetadata';
 import { currentTime } from '../../../stores/motionSignals';
 import { selectDisplayCoverUrl, selectDisplayDuration, selectDisplayPlayerState, selectDisplaySong, selectIsShowingTail, usePlaybackStore } from '../../../stores/usePlaybackStore';
 import { setStatusMessage as setStatusMsg } from '../../../stores/useStatusMessageStore';
@@ -77,6 +77,7 @@ export const useAppPlaybackQueue = (model: Input) => {
         addOnlineSongsToQueue,
         playSong,
         playOnlineQueueFromStart,
+        playOnlineQueueShuffled,
         handleQueueAddAndPlay,
         handleSearchOverlaySubmit,
         handleSearchLoadMore,
@@ -375,6 +376,7 @@ export const useAppPlaybackQueue = (model: Input) => {
             // upgrades the http: covers netease/kugou still hand out - blocked as mixed content in the
             // packaged window - and keeps only the first of a comma-joined multi-value.
             coverUrl: toSafeRemoteUrl(getSongCoverUrl(stageNextUpTrack)) ?? null,
+            album: getSongAlbumLabel(stageNextUpTrack) || null,
         };
     }, [stageTrackPillMode, stageNextUpTrack]);
     const stageIsNextUp = stageNextUp !== null && (isShowingTail || countdownActive);
@@ -417,7 +419,7 @@ export const useAppPlaybackQueue = (model: Input) => {
         // 速记簿要用：「插进队列并播这一首」（playback 页）与「拖动重排队列」（queue 页）。
         handleQueueAddAndPlay, handleStageExternalPlayRequest,
         handleUnavailableReplacementConfirm, incomingLyricTimelineOffsetMs, isShowingTail, loopPositionRef,
-        openSongCardPanel, pendingUnavailableReplacement, playOnlineQueueFromStart, playSong,
+        openSongCardPanel, pendingUnavailableReplacement, playOnlineQueueFromStart, playOnlineQueueShuffled, playSong,
         setPendingUnavailableReplacement, shuffleQueue, skipAfterPlaybackFailure, stageIsNextUp, stageNextUp,
         stageTrackPillOnScreen
     };

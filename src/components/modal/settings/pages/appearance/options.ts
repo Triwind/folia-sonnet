@@ -28,7 +28,13 @@ export const LYRICS_WALLPAPER: SettingsGroupDef = {
 
 export const THEME: SettingsGroupDef = { id: 'themePresets', titleKey: 'options.settingsHeadingTheme' };
 export const SONG_THEME: SettingsGroupDef = { id: 'songTheme', titleKey: 'options.settingsHeadingSongTheme' };
-export const AI: SettingsGroupDef = { id: 'electronSettings', titleKey: 'options.electronSettings', electronOnly: true };
+export const AI: SettingsGroupDef = { id: 'aiCredentials', titleKey: 'options.electronSettings', electronOnly: true };
+
+/**
+ * AI 歌词动画导演那一组（fork 独有）。那几行画在 AiProviderSettings 里、紧挨着 AI 凭证，
+ * 但声明在这里 —— 搜索索引只认各页声明的 OPTIONS，不声明就搜不到（用户反馈过）。
+ */
+export const AI_DIRECTOR: SettingsGroupDef = { id: 'aiDirectorGroup', titleKey: 'aiDirector.title', electronOnly: true };
 
 /**
  * 显示那一组（fork 独有）：歌词扁平两端都画；设备类型与横竖屏只有安卓有。
@@ -75,6 +81,9 @@ export const WALLPAPER = {
 
 export const O = {
     lyricsAnimation: option(LYRICS, 'lyricsAnimationAdjust', 'options.lyricsAnimationAdjust'),
+    scene: option(LYRICS, 'scene', 'ui.scene'),
+    // Not a row of its own: it lives in the scene window, so a search for it lands on the group with the scene row.
+    soundTracing: option(LYRICS, 'soundTracing', 'ui.soundTracing'),
     // 歌词动态壁纸（fork 独有）：整节只有安卓画，搜索里跟着一起退场（组上的 available）。
     lyricsWallpaper: option(LYRICS_WALLPAPER, 'lyricsWallpaper', 'options.lyricsWallpaperSection'),
     daylight: option(THEME, 'daylightMode', 'options.daylightMode'),
@@ -100,15 +109,8 @@ export const O = {
         available: () => !hasElectronBridge(),
     }),
     lyricFlat: option(VIEW, 'lyricFlat', 'options.lyricFlat', { noteKey: 'options.lyricFlatDesc' }),
-    deviceType: option(VIEW, 'deviceType', 'options.deviceType', {
-        noteKey: 'options.deviceTypeDesc',
-        available: isCapacitorAndroid,
-    }),
-    // 界面缩放：设备类型底下的另一根滑条，自己占一行（滑条铺满整行宽）。
-    uiScale: option(VIEW, 'uiScale', 'uiScale.title', {
-        noteKey: 'uiScale.desc',
-        available: isCapacitorAndroid,
-    }),
+    // MV 字幕来源：配 MV 时歌词用原平台的还是这条投稿的。
+    mvLyricSource: option(VIEW, 'mvLyricSource', 'options.mvLyricSource', { noteKey: 'options.mvLyricSourceDesc' }),
     forceLandscape: option(VIEW, 'forceLandscape', 'options.forceLandscape', {
         noteKey: 'options.forceLandscapeDesc',
         available: isCapacitorAndroid,
@@ -121,6 +123,16 @@ export const O = {
     openaiStream: option(AI, 'openaiApiStream', 'options.openaiApiStream'),
     openaiKey: option(AI, 'openaiApiKey', 'options.openaiApiKey'),
     aiProxy: option(AI, 'useSystemProxyAI', 'options.useSystemProxyAI'),
+    // AI 歌词动画导演（fork 独有）：让搜索也能找到这几行。
+    aiDirectorAuto: option(AI_DIRECTOR, 'aiDirectorAutoMode', 'aiDirector.allowAutoMode', {
+        noteKey: 'aiDirector.allowAutoModeDesc',
+    }),
+    aiDirectorParams: option(AI_DIRECTOR, 'aiDirectorAutoParams', 'aiDirector.allowAutoParams', {
+        noteKey: 'aiDirector.allowAutoParamsDesc',
+    }),
+    aiDirectorBlocked: option(AI_DIRECTOR, 'aiDirectorBlockedModes', 'aiDirector.blockedModes', {
+        noteKey: 'aiDirector.modeLockedHint',
+    }),
 };
 
 /** What the wallpaper section draws, which the search lists under the page. */

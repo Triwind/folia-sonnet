@@ -16,6 +16,7 @@ import { PARTICLE_FRAGMENT, PARTICLE_VERTEX, QUAD_VERTEX } from './particlesShad
 import { OrbitStage } from '../orbitStage';
 import { FORM_CAMERA_SCALE, FORM_INDEX, type ParticlesConcreteForm } from './forms';
 import { applyCoverDepthToGeometry, buildParticleGrid } from './geometry';
+import { loadCoverTexture, type CoverUniforms } from './coverLoader';
 
 // src/components/visualizer/backgrounds/particles/ParticlesBackground.tsx
 
@@ -322,58 +323,22 @@ const ParticlesBackground: React.FC<ParticlesBackgroundProps> = ({
          */
         let coverImage: CanvasImageSource | undefined;
         let disposed = false;
+        /*
+         * 封面失败会退避重试几次（见 coverLoader.ts）：部分平台的封面地址是临时
+         * 签名 URL，偶尔 403 / 超时，一次拿不到不该就整场没有封面。
+         */
+        let cancelCoverLoad: (() => void) | null = null;
         if (coverUrl) {
-            loader.load(
-                coverUrl,
-                (loaded) => {
-                    if (disposed) {
-                        loaded.dispose();
-                        return;
-                    }
-                    /*
-                     * flipY 保持 three.js 默认的 true：片元里用
-                     * (vGrid.x, 1.0 - vGrid.y) 采样，两者一正一反正好抵消，
-                     * 画面上封面的上下方向才是对的。改这里要同步改着色器。
-                     */
-                    loaded.colorSpace = THREE.SRGBColorSpace;
-                    loaded.minFilter = THREE.LinearFilter;
-                    loaded.magFilter = THREE.LinearFilter;
-                    loaded.generateMipmaps = false;
-                    texture = loaded;
-                    uniforms.uCover.value = loaded;
-                    uniforms.uHasCover.value = 1;
-                    /*
-                     * 记下封面的真实宽高比：着色器要靠它把屏幕 UV 换成封面 UV，
-                     * 否则正方形封面会被拉成 16:9（设备上看到的就是「封面显示不全」）。
-                     */
-                    const image = loaded.image as { width?: number; height?: number } | undefined;
-                    const cw = image?.width ?? 0;
-                    const ch = image?.height ?? 0;
-                    uniforms.uCoverAspect.value = cw > 0 && ch > 0 ? cw / ch : 1;
-
-                    /*
-                     * 按封面算景深，写进 aDepth。
-                     *
-                     * 这是 Mineradio 那个 R=depth 纹理的本地替代品。
-                     * 那边由 AI 或外部算法产出深度图（estimateAIDepth），
-                     * 我们这里用**亮度**代替：明亮的区域当作离镜头更近。
-                     *
-                     * 这是一个近似，但方向是对的——封面里亮的东西（脸、灯光、天空）
-                     * 本来在视觉上就更「靠前」。它带来的是有层次的起伏，
-                     * 而不是一张随机噪点，也不需要联网。
-                     *
-                     * 先缩到 64×64 再逐点取：原图可能 1000px 宽，
-                     * 逐个属性点去 getImageData 会很慢，而景深本身是低频的，
-                     * 降采样反而更稳、更不容易把封面的细节变成刺。
-                     */
-                    applyCoverDepth(loaded.image as CanvasImageSource | undefined, geometry);
-                    coverImage = loaded.image as CanvasImageSource | undefined;
-                },
-                undefined,
-                () => {
-                    // 封面加载失败就只用主题色，不影响效果本身
-                },
-            );
+            // 装载细节在 coverLoader.ts（含 #294 的退避重试与失败日志）；这里只提供场景里的东西。
+            cancelCoverLoad = loadCoverTexture({
+                url: coverUrl,
+                loader,
+                uniforms: uniforms as unknown as CoverUniforms,
+                isDisposed: () => disposed,
+                onTexture: (loaded) => { texture = loaded as unknown as THREE.Texture<HTMLImageElement>; },
+                onImage: (image) => { coverImage = image; },
+                applyDepth: (image) => applyCoverDepth(image, geometry),
+            });
         }
 
         /*
@@ -384,6 +349,8 @@ const ParticlesBackground: React.FC<ParticlesBackgroundProps> = ({
         if (orbit) {
             stage = new OrbitStage(camera, {
                 distance: baseDistanceRef.current,
+                // 让舞台知道自己是「封面粒子」，好查这个背景单独的陀螺仪开关。
+                gyroMode: 'particles',
                 onChange: () => {
                     /*
                      * 相机动了，可视世界高度与相机距离都得跟着重算 ——
@@ -745,6 +712,7 @@ const ParticlesBackground: React.FC<ParticlesBackgroundProps> = ({
 
         return () => {
             disposed = true;
+            cancelCoverLoad?.();
             cancelAnimationFrame(raf);
             observer?.disconnect();
             window.removeEventListener('resize', resize);

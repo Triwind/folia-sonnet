@@ -29,6 +29,7 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             localLibraryCatalog: { entities: [], assignments: [] },
             navigateToSearch: vi.fn(),
             submitSearch: vi.fn(async () => true),
+            searchHistory: () => [],
         },
         playback: {
             volume: 0.5,
@@ -90,6 +91,11 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
         },
         settings: {
             toggleRememberHomeCardPosition: vi.fn(),
+            liquidGlassEnabled: vi.fn(() => false),
+            toggleLiquidGlass: vi.fn(),
+            toggleBackgroundSilentSkip: vi.fn(),
+            sleepTimerEndAction: 'pause' as const,
+            setSleepTimerMinutesMode: vi.fn(),
             openSettings: vi.fn(),
             lyricStaffPolicy: 'smart' as const,
             cycleLyricStaffPolicy: vi.fn(),
@@ -117,8 +123,6 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             toggleLibraryWallStackEdges: vi.fn(),
             libraryWallSeamClear: vi.fn(() => false),
             toggleLibraryWallSeamClear: vi.fn(),
-            liquidGlassEnabled: vi.fn(() => true),
-            toggleLiquidGlass: vi.fn(),
             libraryWallSeamStyle: vi.fn(() => 'paper' as const),
             setLibraryWallSeamStyle: vi.fn(),
             toggleLibraryWallBackdropLyrics: vi.fn(),
@@ -135,6 +139,8 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             toggleGridViewSquareCards: vi.fn(),
             canUseGridViewSquareCards: vi.fn(() => true),
             toggleLatticeVignette: vi.fn(),
+            toggleLatticeWallForm: vi.fn(),
+            toggleLatticeRadioHideUpcoming: vi.fn(),
             toggleLatticeBadgeCurrentOnly: vi.fn(),
             toggleLatticeAutoFocusOnSongChange: vi.fn(),
             toggleReduceLatticeMotion: vi.fn(),
@@ -152,11 +158,13 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             toggleTranscodeFallback: vi.fn(),
             togglePlaybackFade: vi.fn(),
             toggleAutoSkipUnplayable: vi.fn(),
-            toggleBackgroundSilentSkip: vi.fn(),
+            toggleShuffleRoundNoRepeat: vi.fn(),
             toggleAlwaysShowMainWindowTitlebar: vi.fn(),
             togglePlayerHeaderBlur: vi.fn(),
+            toggleTitlebarSide: vi.fn(),
             toggleHideFullscreenButton: vi.fn(),
             toggleNativeMacFullscreenButton: vi.fn(),
+            toggleNativeMacTrafficLights: vi.fn(),
             toggleAutoHideCursorWithPlayerChrome: vi.fn(),
             toggleHideCursorWhenIdle: vi.fn(),
             canAutoScanLocalLibrary: vi.fn(() => false),
@@ -175,6 +183,7 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             toggleHideRemoteControlTitlebar: vi.fn(),
             toggleRemoteControlExpandCover: vi.fn(),
             toggleRemoteControlTextShade: vi.fn(),
+            toggleRemoteLyricPairs: vi.fn(),
             unlockRemoteControl: vi.fn(),
             toggleObsKeepMainWindowAnimation: vi.fn(),
             toggleTrackCardInObs: vi.fn(),
@@ -188,8 +197,6 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             sleepTimerMinutes: 0,
             setSleepTimerMinutes: vi.fn(),
             sleepTimerDeadlineMs: null,
-            sleepTimerEndAction: 'pause' as const,
-            setSleepTimerMinutesMode: vi.fn(),
             canGenerateAITheme: true,
             isGeneratingTheme: false,
             generateAITheme: vi.fn(),
@@ -220,6 +227,8 @@ const createContext = (overrides: CommandPaletteContextOverrides = {}): CommandP
             visualizerMode: 'classic',
             visualizerBackgroundMode: 'latent',
             setVisualizerMode: vi.fn(),
+            visualizerPickerKeepOpen: false,
+            setVisualizerPickerKeepOpen: vi.fn(),
             toggleRandomVisualizerModePerSong: vi.fn(),
             toggleGlowBlurQuantize: vi.fn(),
             setVisualizerBackgroundMode: vi.fn(),
@@ -743,7 +752,7 @@ describe('command palette registry', () => {
     });
 
     it('retains settings-desktop command in desktop app environment', () => {
-        vi.stubGlobal('window', { electron: {} });
+        vi.stubGlobal('window', { electron: { platform: 'electron' } });
 
         try {
             const matches = getCommandPaletteMatches('desktop');
@@ -866,7 +875,7 @@ describe('command palette registry', () => {
     });
 
     it('matches and executes desktop window toggle commands', async () => {
-        vi.stubGlobal('window', { electron: {} });
+        vi.stubGlobal('window', { electron: { platform: 'electron' } });
 
         try {
             const context = createContext();
@@ -885,7 +894,7 @@ describe('command palette registry', () => {
     });
 
     it('hides the always-on-top command where the window cannot stay on top (native Wayland)', () => {
-        vi.stubGlobal('window', { electron: {} });
+        vi.stubGlobal('window', { electron: { platform: 'electron' } });
 
         try {
             const context = createContext();
@@ -901,7 +910,7 @@ describe('command palette registry', () => {
     it('toggles the desktop-local lyrics API', async () => {
         const getLyricApiStatus = vi.fn().mockResolvedValue({ enabled: false, running: false });
         const setLyricApiEnabled = vi.fn().mockResolvedValue({ enabled: true, running: true });
-        vi.stubGlobal('window', { electron: { getLyricApiStatus, setLyricApiEnabled } });
+        vi.stubGlobal('window', { electron: { platform: 'electron', getLyricApiStatus, setLyricApiEnabled } });
 
         try {
             const context = createContext();
@@ -916,7 +925,7 @@ describe('command palette registry', () => {
     });
 
     it('matches and executes the desktop display sleep toggle', async () => {
-        vi.stubGlobal('window', { electron: {} });
+        vi.stubGlobal('window', { electron: { platform: 'electron' } });
         try {
             const context = createContext();
             const [match] = getCommandPaletteMatches('播放时阻止休眠', context);
@@ -929,7 +938,7 @@ describe('command palette registry', () => {
     });
 
     it('matches and executes the desktop background throttling toggle', async () => {
-        vi.stubGlobal('window', { electron: {} });
+        vi.stubGlobal('window', { electron: { platform: 'electron' } });
         try {
             const context = createContext();
             const [match] = getCommandPaletteMatches('后台节流', context);
