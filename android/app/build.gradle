@@ -96,7 +96,7 @@ android {
          * 本机验证一直用真机（arm64），所以不影响发布流程。
          */
         ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a'
+            abiFilters 'arm64-v8a'
         }
         /*
          * Node 运行时（nodejs-mobile 18.20.4 移植版，见 src/main/cpp/）。
